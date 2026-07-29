@@ -238,6 +238,8 @@ const runtime = {
   exportUrl: "",
   layerMemory: {},
   previewDebounceId: 0,
+  previewQueued: false,
+  previewQueuedMessage: "",
   previewRequestId: 0,
   previewUrl: "",
   wholePreviewReady: false,
@@ -595,9 +597,15 @@ async function toggleFullscreen() {
       return;
     }
 
+    if (!document.fullscreenEnabled || typeof elements.appShell.requestFullscreen !== "function") {
+      updateStatus("Fullscreen is not available in this mobile browser.", "error");
+      return;
+    }
+
     await elements.appShell.requestFullscreen();
   } catch (error) {
     console.warn("Fullscreen toggle failed", error);
+    updateStatus("Fullscreen could not be opened in this browser.", "error");
   }
 }
 
@@ -717,7 +725,9 @@ function updateThemeUi() {
 
 function applyModeUi() {
   for (const button of elements.modeButtons) {
-    button.classList.toggle("is-active", button.dataset.mode === runtime.state.mode);
+    const active = button.dataset.mode === runtime.state.mode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
   }
 }
 
@@ -807,8 +817,12 @@ function updateRoomUi() {
     const active = stateKey ? Number(runtime.state[stateKey]) > 3 : false;
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-pressed", String(active));
+    const stateLabel = button.querySelector("[data-room-control-state]");
+    if (stateLabel) {
+      stateLabel.textContent = active ? "On" : "Off";
+    }
 
-    if (active && CHIP_META[layerId]) {
+    if (active && CHIP_META[layerId] && !activeLayers.includes(CHIP_META[layerId].label.toLowerCase())) {
       activeLayers.push(CHIP_META[layerId].label.toLowerCase());
     }
   }
@@ -818,6 +832,10 @@ function updateRoomUi() {
     button.classList.toggle("is-source-active", sourceActive);
     if (button.dataset.roomAction === "source") {
       button.setAttribute("aria-pressed", String(sourceActive));
+    }
+    const stateLabel = button.querySelector("[data-room-control-state]");
+    if (stateLabel) {
+      stateLabel.textContent = button.dataset.roomAction === "source" ? "Next" : "Change";
     }
   }
 
@@ -1048,9 +1066,6 @@ function setBusy(isBusy, kind, message = "") {
   elements.loadDemoButton.disabled = isBusy;
   elements.playPauseButton.disabled = isBusy && !getActiveAudio();
   elements.roomPlayButton.disabled = isBusy && !getActiveAudio();
-  for (const button of [...elements.roomLayerButtons, ...elements.roomActionButtons]) {
-    button.disabled = isBusy;
-  }
   elements.transportState.textContent = isBusy
     ? kind === "export"
       ? "rendering export"
@@ -1063,6 +1078,13 @@ function setBusy(isBusy, kind, message = "") {
 
   if (message) {
     updateStatus(message, isBusy ? "loading" : "success");
+  }
+
+  if (!isBusy && runtime.previewQueued) {
+    const queuedMessage = runtime.previewQueuedMessage;
+    runtime.previewQueued = false;
+    runtime.previewQueuedMessage = "";
+    window.setTimeout(() => schedulePreview(queuedMessage), 0);
   }
 }
 
@@ -1082,7 +1104,13 @@ function updateStatus(message, tone = "neutral") {
 
 function schedulePreview(message) {
   window.clearTimeout(runtime.previewDebounceId);
-  if (!hasSourceTrack() || runtime.busy) {
+  if (!hasSourceTrack()) {
+    return;
+  }
+
+  if (runtime.busy) {
+    runtime.previewQueued = true;
+    runtime.previewQueuedMessage = message || runtime.previewQueuedMessage;
     return;
   }
 
@@ -1117,6 +1145,17 @@ async function renderPreview(options = {}) {
   }
 
   const { autoplay = false } = options;
+
+  if (runtime.wholePreviewReady && getWholePreviewAudioElement().src) {
+    runtime.livePreview.session = buildSession();
+    if (autoplay) {
+      await playAudio(getWholePreviewAudioElement());
+    } else {
+      syncPlayerState();
+    }
+    return;
+  }
+
   const requestId = ++runtime.previewRequestId;
   const session = buildSession();
   setBusy(true, "preview", "Preparing whole-session preview...");
@@ -1160,7 +1199,7 @@ async function renderPreview(options = {}) {
     }
 
     if (autoplay) {
-      await playAudio(elements.processedPreview);
+      await playAudio(getWholePreviewAudioElement());
     } else {
       syncPlayerState();
     }

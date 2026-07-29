@@ -2,15 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Lo-Fi Room Lab</title>
-    <link rel="stylesheet" href="./styles.css?v=20260704ui2" />
+    <link rel="stylesheet" href="./styles.css?v=20260730mobile1" />
   </head>
   <body>
     <div class="app-shell theme-plum" id="appShell">
       <main class="app-column">
         <header class="icon-bar" aria-label="Toolbar">
-          <button id="fullscreenButton" class="tool-icon" type="button" aria-label="Toggle fullscreen">
+          <button id="fullscreenButton" class="tool-icon" type="button" aria-label="Toggle fullscreen" title="Fullscreen">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 9V4h5" />
               <path d="M20 9V4h-5" />
@@ -18,7 +18,7 @@
               <path d="M20 15v5h-5" />
             </svg>
           </button>
-          <button id="shuffleButton" class="tool-icon" type="button" aria-label="Shuffle mix">
+          <button id="shuffleButton" class="tool-icon" type="button" aria-label="Shuffle mix" title="Shuffle mix">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M16 3h5v5" />
               <path d="M4 20l7-7" />
@@ -32,7 +32,7 @@
             <div class="brand-disc"></div>
           </div>
 
-          <button id="themeButton" class="tool-icon" type="button" aria-label="Cycle theme">
+          <button id="themeButton" class="tool-icon" type="button" aria-label="Cycle theme" title="Change theme">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 3a9 9 0 1 0 9 9c0-.7-.08-1.38-.24-2.02A4.5 4.5 0 0 1 15.5 5.5c-.64.16-1.32.24-2.02.24A9 9 0 0 0 12 3Z" />
               <circle cx="8" cy="12" r="1" />
@@ -40,7 +40,7 @@
               <circle cx="16" cy="13" r="1" />
             </svg>
           </button>
-          <button id="moodButton" class="tool-icon" type="button" aria-label="Cycle mood">
+          <button id="moodButton" class="tool-icon" type="button" aria-label="Cycle mood" title="Next session">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="8" />
               <path d="M9 10h.01" />
@@ -60,8 +60,8 @@
 
           <div class="hero-row">
             <div class="mode-pills" role="tablist" aria-label="Processing mode">
-              <button id="modeLofi" class="mode-pill is-active" data-mode="lofi" type="button">Lo-Fi</button>
-              <button id="modeRemix" class="mode-pill" data-mode="remix" type="button">Remix</button>
+              <button id="modeLofi" class="mode-pill is-active" data-mode="lofi" type="button" aria-selected="true">Lo-Fi</button>
+              <button id="modeRemix" class="mode-pill" data-mode="remix" type="button" aria-selected="false">Remix</button>
             </div>
 
             <div class="hero-meta">
@@ -93,36 +93,71 @@
                 <button id="roomPlayButton" class="room-start" type="button" aria-label="Start room" title="Play room">start</button>
               </div>
               <p id="roomStatus" class="room-status">Mirostar Beats / 76 BPM / dust, drums, rain, cafe</p>
+              <div class="room-control-dock" role="group" aria-label="Room item controls">
+                <button class="room-control rain" type="button" data-room-layer="rain" aria-label="Toggle rain window ambience">
+                  <span class="room-control-mark" aria-hidden="true">R</span>
+                  <span class="room-control-copy"><strong>Rain</strong><small data-room-control-state>On</small></span>
+                </button>
+                <button class="room-control lamp" type="button" data-room-action="mood" aria-label="Cycle mood with the hanging light">
+                  <span class="room-control-mark" aria-hidden="true">L</span>
+                  <span class="room-control-copy"><strong>Lamp</strong><small data-room-control-state>Change</small></span>
+                </button>
+                <button class="room-control vinyl" type="button" data-room-layer="dust" aria-label="Toggle vinyl turntable dust">
+                  <span class="room-control-mark" aria-hidden="true">V</span>
+                  <span class="room-control-copy"><strong>Vinyl</strong><small data-room-control-state>On</small></span>
+                </button>
+                <button class="room-control radio" type="button" data-room-layer="drums" aria-label="Toggle radio drum layer">
+                  <span class="room-control-mark" aria-hidden="true">B</span>
+                  <span class="room-control-copy"><strong>Radio</strong><small data-room-control-state>On</small></span>
+                </button>
+                <button class="room-control cafe" type="button" data-room-layer="cafe" aria-label="Toggle coffee cup cafe ambience">
+                  <span class="room-control-mark" aria-hidden="true">C</span>
+                  <span class="room-control-copy"><strong>Cafe</strong><small data-room-control-state>On</small></span>
+                </button>
+                <button class="room-control track" type="button" data-room-action="source" aria-label="Switch preset with the keyboard">
+                  <span class="room-control-mark" aria-hidden="true">T</span>
+                  <span class="room-control-copy"><strong>Track</strong><small data-room-control-state>Next</small></span>
+                </button>
+              </div>
             </div>
           </div>
         </section>
 
-        <section class="preset-grid" id="presetGrid" aria-label="Preset sessions">
-          <button class="preset-card is-active" type="button" data-session="focus">
-            <span>Lo-Fi / 30 min</span>
-            <strong>Mirostar Beats</strong>
-            <em>Royalty-free study beat with warm dust.</em>
-          </button>
-          <button class="preset-card" type="button" data-session="cozy">
-            <span>Lo-Fi / 30 min</span>
-            <strong>Good Night Cozy</strong>
-            <em>Soft night loop with cafe air.</em>
-          </button>
-          <button class="preset-card" type="button" data-session="smooth">
-            <span>Lo-Fi / 30 min</span>
-            <strong>Pulsebox Smooth</strong>
-            <em>Smooth pulse, low swing, clear headspace.</em>
-          </button>
-          <button class="preset-card" type="button" data-session="mountain">
-            <span>Lo-Fi / 30 min</span>
-            <strong>Mountain Lo-Fi</strong>
-            <em>Open-air texture and rain-window calm.</em>
-          </button>
-          <button class="preset-card" type="button" data-session="pretty">
-            <span>Lo-Fi / 30 min</span>
-            <strong>PrettyJohn Lo-Fi</strong>
-            <em>Light melodic loop with desk glow.</em>
-          </button>
+        <section class="preset-panel" aria-labelledby="presetHeading">
+          <div class="section-heading">
+            <div>
+              <p>Session select</p>
+              <h2 id="presetHeading">30-minute categories</h2>
+            </div>
+            <span aria-hidden="true">Choose a track</span>
+          </div>
+          <div class="preset-grid" id="presetGrid" aria-label="Preset sessions">
+            <button class="preset-card is-active" type="button" data-session="focus">
+              <span>Lo-Fi / 30 min</span>
+              <strong>Mirostar Beats</strong>
+              <em>Royalty-free study beat with warm dust.</em>
+            </button>
+            <button class="preset-card" type="button" data-session="cozy">
+              <span>Lo-Fi / 30 min</span>
+              <strong>Good Night Cozy</strong>
+              <em>Soft night loop with cafe air.</em>
+            </button>
+            <button class="preset-card" type="button" data-session="smooth">
+              <span>Lo-Fi / 30 min</span>
+              <strong>Pulsebox Smooth</strong>
+              <em>Smooth pulse, low swing, clear headspace.</em>
+            </button>
+            <button class="preset-card" type="button" data-session="mountain">
+              <span>Lo-Fi / 30 min</span>
+              <strong>Mountain Lo-Fi</strong>
+              <em>Open-air texture and rain-window calm.</em>
+            </button>
+            <button class="preset-card" type="button" data-session="pretty">
+              <span>Lo-Fi / 30 min</span>
+              <strong>PrettyJohn Lo-Fi</strong>
+              <em>Light melodic loop with desk glow.</em>
+            </button>
+          </div>
         </section>
 
         <section class="sound-stack">
@@ -293,13 +328,13 @@
           </div>
         </section>
 
-        <audio id="originalPreview" preload="auto"></audio>
-        <audio id="processedPreview" preload="auto"></audio>
+        <audio id="originalPreview" preload="metadata" playsinline></audio>
+        <audio id="processedPreview" preload="metadata" playsinline></audio>
       </main>
     </div>
 
     <script src="./assets/vendor/lame.min.js"></script>
     <script src="./engine.js?v=20260629louder"></script>
-    <script src="./app.js?v=20260704ui2"></script>
+    <script src="./app.js?v=20260730mobile1"></script>
   </body>
 </html>
