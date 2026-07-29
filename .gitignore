@@ -1,0 +1,14 @@
+node_modules/
+.agents/
+.codex/
+.chrome-e2e*/
+.edge-e2e*/
+.git-broken-backup-*/
+__pycache__/
+*.pyc
+*.log
+.Rhistory
+.Rproj.user/
+
+# Generated and currently unused by the published room player.
+assets/starter-session-1h.mp3

@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "serve": "node scripts/static-server.mjs 4174"
+  },
+  "dependencies": {
+    "lamejs": "^1.2.1"
+  }
+}

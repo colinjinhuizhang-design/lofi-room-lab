@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lo-Fi Room Lab</title>
+    <link rel="stylesheet" href="./styles.css?v=20260704ui2" />
+  </head>
+  <body>
+    <div class="app-shell theme-plum" id="appShell">
+      <main class="app-column">
+        <header class="icon-bar" aria-label="Toolbar">
+          <button id="fullscreenButton" class="tool-icon" type="button" aria-label="Toggle fullscreen">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9V4h5" />
+              <path d="M20 9V4h-5" />
+              <path d="M4 15v5h5" />
+              <path d="M20 15v5h-5" />
+            </svg>
+          </button>
+          <button id="shuffleButton" class="tool-icon" type="button" aria-label="Shuffle mix">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M16 3h5v5" />
+              <path d="M4 20l7-7" />
+              <path d="M14 7l6 6" />
+              <path d="M4 4l5 5" />
+              <path d="M20 16v5h-5" />
+            </svg>
+          </button>
+
+          <div class="brand-stamp" aria-hidden="true">
+            <div class="brand-disc"></div>
+          </div>
+
+          <button id="themeButton" class="tool-icon" type="button" aria-label="Cycle theme">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3a9 9 0 1 0 9 9c0-.7-.08-1.38-.24-2.02A4.5 4.5 0 0 1 15.5 5.5c-.64.16-1.32.24-2.02.24A9 9 0 0 0 12 3Z" />
+              <circle cx="8" cy="12" r="1" />
+              <circle cx="12" cy="8" r="1" />
+              <circle cx="16" cy="13" r="1" />
+            </svg>
+          </button>
+          <button id="moodButton" class="tool-icon" type="button" aria-label="Cycle mood">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="8" />
+              <path d="M9 10h.01" />
+              <path d="M15 10h.01" />
+              <path d="M8.5 15c1 .9 2.2 1.5 3.5 1.5s2.5-.6 3.5-1.5" />
+            </svg>
+          </button>
+        </header>
+
+        <section class="hero">
+          <p class="hero-kicker">Pixel room instrument / lo-fi session mixer</p>
+          <h1>
+            Lo-Fi Room
+            <br />
+            <span>Player</span>
+          </h1>
+
+          <div class="hero-row">
+            <div class="mode-pills" role="tablist" aria-label="Processing mode">
+              <button id="modeLofi" class="mode-pill is-active" data-mode="lofi" type="button">Lo-Fi</button>
+              <button id="modeRemix" class="mode-pill" data-mode="remix" type="button">Remix</button>
+            </div>
+
+            <div class="hero-meta">
+              <span id="moodReadout" class="meta-pill">Focus Mood</span>
+              <span id="tempoReadout" class="meta-pill">76 BPM</span>
+              <button id="loadDemoButton" class="meta-button" type="button">Next preset</button>
+            </div>
+          </div>
+
+          <p id="statusMessage" class="status-message">
+            Start with a 30-minute or 1-hour preset, then fade in Lo-Fi and Remix layers.
+          </p>
+
+          <div class="room-stage" aria-label="Interactive lo-fi room">
+            <div class="room-frame">
+              <div class="room-scene">
+                <canvas id="roomCanvas" class="room-canvas" width="960" height="600" aria-hidden="true"></canvas>
+
+                <div class="room-hotspots" aria-label="Room controls">
+                  <button class="room-object room-window" type="button" data-room-layer="rain" aria-label="Toggle rain window ambience" title="Rain window"></button>
+                  <button class="room-object room-lamp" type="button" data-room-action="mood" aria-label="Cycle mood with the hanging light" title="Lamp light"></button>
+                  <button class="room-object room-turntable" type="button" data-room-layer="dust" aria-label="Toggle vinyl turntable dust" title="Vinyl turntable"></button>
+                  <button class="room-object room-radio" type="button" data-room-layer="drums" aria-label="Toggle radio drum layer" title="Radio drums"></button>
+                  <button class="room-object room-cup" type="button" data-room-layer="cafe" aria-label="Toggle coffee cup cafe ambience" title="Coffee cup"></button>
+                  <button class="room-object room-keyboard" type="button" data-room-action="source" aria-label="Switch preset with the keyboard" title="Keyboard preset"></button>
+                </div>
+
+                <div id="roomClock" class="room-clock" aria-live="polite">23:46</div>
+                <button id="roomPlayButton" class="room-start" type="button" aria-label="Start room" title="Play room">start</button>
+              </div>
+              <p id="roomStatus" class="room-status">Mirostar Beats / 76 BPM / dust, drums, rain, cafe</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="preset-grid" id="presetGrid" aria-label="Preset sessions">
+          <button class="preset-card is-active" type="button" data-session="focus">
+            <span>Lo-Fi / 30 min</span>
+            <strong>Mirostar Beats</strong>
+            <em>Royalty-free study beat with warm dust.</em>
+          </button>
+          <button class="preset-card" type="button" data-session="cozy">
+            <span>Lo-Fi / 30 min</span>
+            <strong>Good Night Cozy</strong>
+            <em>Soft night loop with cafe air.</em>
+          </button>
+          <button class="preset-card" type="button" data-session="smooth">
+            <span>Lo-Fi / 30 min</span>
+            <strong>Pulsebox Smooth</strong>
+            <em>Smooth pulse, low swing, clear headspace.</em>
+          </button>
+          <button class="preset-card" type="button" data-session="mountain">
+            <span>Lo-Fi / 30 min</span>
+            <strong>Mountain Lo-Fi</strong>
+            <em>Open-air texture and rain-window calm.</em>
+          </button>
+          <button class="preset-card" type="button" data-session="pretty">
+            <span>Lo-Fi / 30 min</span>
+            <strong>PrettyJohn Lo-Fi</strong>
+            <em>Light melodic loop with desk glow.</em>
+          </button>
+        </section>
+
+        <section class="sound-stack">
+          <article class="sound-card source-card" id="sourceCard" data-layer="source">
+            <div class="card-art">
+              <img class="card-bg" src="./assets/source-mic.png" alt="" />
+              <div class="card-overlay"></div>
+              <canvas id="screenWaveform" width="1120" height="300"></canvas>
+              <div class="card-copy">
+                <div class="card-badge session">1H</div>
+                <div>
+                  <h2>Preset Session</h2>
+                  <p id="fileName">Mirostar Beats</p>
+                </div>
+              </div>
+              <button id="sourceActionButton" class="card-action primary" type="button">Switch</button>
+            </div>
+
+            <label class="slider-row">
+              <span>Base</span>
+              <input id="mixUpload" type="range" min="0" max="100" value="90" />
+              <strong id="mixUploadValue">90%</strong>
+            </label>
+
+            <div class="source-meta">
+              <span id="fileDuration">--:--</span>
+              <span id="fileSize">--</span>
+              <span id="transportState">waiting for source</span>
+            </div>
+          </article>
+
+          <article class="sound-card" id="dustCard" data-layer="dust">
+            <div class="card-art">
+              <img class="card-bg" src="./assets/vinyl-dust.png" alt="" />
+              <div class="card-overlay"></div>
+              <div class="card-copy">
+                <div class="card-badge dust">D</div>
+                <div>
+                  <h2>Lo-Fi Dust</h2>
+                  <p>Vinyl noise, crackle and a warm harmonic bed.</p>
+                </div>
+              </div>
+              <button id="toggleDust" class="card-action" type="button">Active</button>
+            </div>
+
+            <label class="slider-row">
+              <span>Volume</span>
+              <input id="layerDust" type="range" min="0" max="100" value="74" />
+              <strong id="layerDustValue">74%</strong>
+            </label>
+          </article>
+
+          <article class="sound-card" id="drumsCard" data-layer="drums">
+            <div class="card-art">
+              <img class="card-bg" src="./assets/boom-bap.png" alt="" />
+              <div class="card-overlay"></div>
+              <div class="card-copy">
+                <div class="card-badge drums">BEAT</div>
+                <div>
+                  <h2>Boom Bap Drums</h2>
+                  <p>Kick, snare and hats driven by the remix engine.</p>
+                </div>
+              </div>
+              <button id="toggleDrums" class="card-action" type="button">Active</button>
+            </div>
+
+            <label class="slider-row">
+              <span>Volume</span>
+              <input id="layerDrums" type="range" min="0" max="100" value="78" />
+              <strong id="layerDrumsValue">78%</strong>
+            </label>
+          </article>
+
+          <article class="sound-card" id="rainCard" data-layer="rain">
+            <div class="card-art">
+              <img class="card-bg" src="./assets/rain-room.png" alt="" />
+              <div class="card-overlay"></div>
+              <div class="card-copy">
+                <div class="card-badge rain">RAIN</div>
+                <div>
+                  <h2>Rain Room</h2>
+                  <p>Blue-hour rain texture for calm lo-fi space.</p>
+                </div>
+              </div>
+              <button id="toggleRain" class="card-action" type="button">Active</button>
+            </div>
+
+            <label class="slider-row">
+              <span>Volume</span>
+              <input id="layerRain" type="range" min="0" max="100" value="68" />
+              <strong id="layerRainValue">68%</strong>
+            </label>
+          </article>
+
+          <article class="sound-card" id="cafeCard" data-layer="cafe">
+            <div class="card-art">
+              <img class="card-bg" src="./assets/cafe-air.png" alt="" />
+              <div class="card-overlay"></div>
+              <div class="card-copy">
+                <div class="card-badge cafe">CAFE</div>
+                <div>
+                  <h2>Cafe Air</h2>
+                  <p>Warm room tone to soften the edges of the mix.</p>
+                </div>
+              </div>
+              <button id="toggleCafe" class="card-action" type="button">Active</button>
+            </div>
+
+            <label class="slider-row">
+              <span>Volume</span>
+              <input id="layerCafe" type="range" min="0" max="100" value="62" />
+              <strong id="layerCafeValue">62%</strong>
+            </label>
+          </article>
+        </section>
+
+        <section class="mixer-dock">
+          <div class="dock-top">
+            <div class="dock-panel">
+              <p class="dock-label">Active Sounds</p>
+              <div id="activeSoundChips" class="chip-row"></div>
+            </div>
+
+            <div class="dock-panel controls">
+              <p class="dock-label">Master Volume</p>
+
+              <label class="master-row">
+                <span>VOL</span>
+                <input id="mixMaster" type="range" min="0" max="100" value="88" />
+                <strong id="mixMasterValue">88%</strong>
+              </label>
+
+              <label class="master-row window-row">
+                <span>Position</span>
+                <input id="previewPosition" type="range" min="0" max="100" value="0" />
+                <strong id="previewPositionValue">0%</strong>
+              </label>
+
+              <div class="dock-actions">
+                <button id="renderPreviewButton" class="action-button ghost" type="button">Preview</button>
+                <button id="renderFullButton" class="action-button primary" type="button">Export Mix</button>
+              </div>
+
+              <a id="downloadLink" class="download-link is-disabled" href="#" download="" aria-disabled="true">
+                Download MP3
+              </a>
+            </div>
+          </div>
+
+          <div class="player-strip">
+            <div id="playerArt" class="player-art" aria-hidden="true"></div>
+
+            <div class="player-copy">
+              <strong id="screenTitle">Your remix</strong>
+              <span id="previewMeta">Render a whole-session preview to hear the layered mix.</span>
+              <span id="renderSummary">Focus mood armed with a lo-fi shell and soft room ambience.</span>
+            </div>
+
+            <div class="player-controls">
+              <button id="playPauseButton" class="play-button" type="button" aria-label="Play or pause">Play</button>
+
+              <div class="player-progress">
+                <canvas id="timelineWaveform" width="520" height="72"></canvas>
+                <input id="seekSlider" type="range" min="0" max="1000" value="0" />
+                <span id="timelineReadout">00:00 / 00:00</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <audio id="originalPreview" preload="auto"></audio>
+        <audio id="processedPreview" preload="auto"></audio>
+      </main>
+    </div>
+
+    <script src="./assets/vendor/lame.min.js"></script>
+    <script src="./engine.js?v=20260629louder"></script>
+    <script src="./app.js?v=20260704ui2"></script>
+  </body>
+</html>
