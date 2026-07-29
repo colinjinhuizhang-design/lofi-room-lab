@@ -4,6 +4,8 @@ An interactive 2D lo-fi room and browser-based music mixer. Choose a royalty-fre
 music preset, control the room objects, blend ambience and generated layers, and
 export a processed mix without uploading audio to a server.
 
+**Live app:** [colinjinhuizhang-design.github.io/lofi-room-lab](https://colinjinhuizhang-design.github.io/lofi-room-lab/)
+
 ## Features
 
 - Five local royalty-free lo-fi music presets
