@@ -3276,7 +3276,7 @@ button:disabled {
 
 @media (min-width: 1101px) {
   .hero {
-    grid-template-columns: minmax(0, 1fr) minmax(360px, 0.55fr);
+    grid-template-columns: minmax(0, 1fr) minmax(380px, 0.55fr);
   }
 
   .hero-row {
