@@ -3262,7 +3262,7 @@ button:disabled {
   }
 
   .hero-meta {
-    grid-template-columns: minmax(0, 1fr) 82px 112px;
+    grid-template-columns: minmax(0, 1fr) 82px 136px;
   }
 
   .hero-meta .meta-button {
