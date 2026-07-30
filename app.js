@@ -165,7 +165,7 @@ const CHIP_META = {
 };
 
 const PREVIEW_MESSAGE = "Render a whole-session preview to hear the layered mix.";
-const MOBILE_ROOM_FPS = 30;
+const MOBILE_ROOM_FPS = 24;
 const DESKTOP_ROOM_FPS = 60;
 const ROOM_SCENE_STALE_MS = 1800;
 
@@ -273,14 +273,20 @@ const runtime = {
     sourceSwitchId: 0,
   },
   roomScene: {
+    bufferCanvas: null,
+    bufferContext: null,
     context: null,
     generation: 0,
+    intersectionObserver: null,
+    isVisible: true,
     lastDrawTimestamp: 0,
     lastErrorLogTimestamp: 0,
+    lastPresentTimestamp: 0,
     rafId: 0,
     lastTimestamp: 0,
     listenersBound: false,
     pointer: { x: -1, y: -1 },
+    presentTimerId: 0,
     recoveryTimerId: 0,
     watchdogId: 0,
   },
@@ -850,7 +856,7 @@ async function continuePlaybackAfterSourceSwitch(audio, switchId, moodLabel) {
     tickWaveforms();
     ensureRoomSceneRunning({ redraw: true });
     if (usesMobileRenderingProfile()) {
-      scheduleRoomSceneSurfaceRecovery(90);
+      scheduleRoomScenePresent(120);
     }
     return true;
   } catch (error) {
@@ -1707,7 +1713,7 @@ function smoothRebuildLivePreviewGraph(session) {
         updateLivePreviewMix(session, { smooth: true });
         ensureRoomSceneRunning({ redraw: true });
         if (usesMobileRenderingProfile()) {
-          scheduleRoomSceneSurfaceRecovery(90);
+          scheduleRoomScenePresent(120);
         }
         if (
           shouldContinuePlaying &&
@@ -2085,11 +2091,13 @@ async function playAudio(audio, options = {}) {
     syncPlayerState();
     ensureRoomSceneRunning({ redraw: true });
     if (usesMobileRenderingProfile()) {
-      scheduleRoomSceneSurfaceRecovery(90);
+      scheduleRoomScenePresent(120);
     }
     return true;
   } catch (error) {
-    console.warn("Playback failed", error);
+    if (!(autoplayAttempt && error?.name === "NotAllowedError")) {
+      console.warn("Playback failed", error);
+    }
     runtime.playback.desiredPlaying = false;
     runtime.playback.pendingResume = false;
     showPlaybackGestureFallback(
@@ -2147,7 +2155,7 @@ function tickWaveforms() {
       runtime.rafId = requestAnimationFrame(animate);
     }
 
-    const frameInterval = usesMobileRenderingProfile() ? 140 : 70;
+    const frameInterval = usesMobileRenderingProfile() ? 200 : 70;
     if (
       runtime.lastPlayerFrameTimestamp &&
       timestamp - runtime.lastPlayerFrameTimestamp < frameInterval
@@ -2183,7 +2191,7 @@ function drawWaveformCanvas(canvas, peaks, hero) {
   gradient.addColorStop(0, "rgba(255, 135, 197, 0.95)");
   gradient.addColorStop(1, "rgba(79, 152, 255, 0.9)");
   context.fillStyle = gradient;
-  context.shadowBlur = hero ? 22 : 10;
+  context.shadowBlur = usesMobileRenderingProfile() ? 0 : hero ? 22 : 10;
   context.shadowColor = "rgba(255, 117, 188, 0.35)";
 
   for (let index = 0; index < values.length; index += 1) {
@@ -2291,8 +2299,9 @@ function startRoomScene() {
     return;
   }
 
-  const context = canvas.getContext("2d");
-  if (!context) {
+  const bufferContext = ensureRoomSceneBuffer();
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!bufferContext || !context) {
     console.warn("The room canvas could not be initialized.");
     return;
   }
@@ -2310,21 +2319,21 @@ function startRoomScene() {
         return;
       }
 
-      scheduleRoomSceneSurfaceRecovery(0);
+      scheduleRoomScenePresent(0);
       void resumePlaybackAfterPageReturn();
     });
 
     window.addEventListener("pageshow", () => {
-      scheduleRoomSceneSurfaceRecovery(0);
+      scheduleRoomScenePresent(0);
       void resumePlaybackAfterPageReturn();
     });
 
     window.addEventListener("resize", () => {
-      scheduleRoomSceneSurfaceRecovery(110);
+      scheduleRoomScenePresent(100);
     });
 
     window.addEventListener("orientationchange", () => {
-      scheduleRoomSceneSurfaceRecovery(110);
+      scheduleRoomScenePresent(160);
     });
 
     canvas.addEventListener("contextlost", (event) => {
@@ -2339,8 +2348,27 @@ function startRoomScene() {
       scheduleRoomSceneSurfaceRecovery(0);
     });
 
+    if (typeof IntersectionObserver === "function") {
+      runtime.roomScene.intersectionObserver = new IntersectionObserver(
+        ([entry]) => {
+          const isVisible = Boolean(entry?.isIntersecting);
+          runtime.roomScene.isVisible = isVisible;
+
+          if (!isVisible) {
+            cancelAnimationFrame(runtime.roomScene.rafId);
+            runtime.roomScene.rafId = 0;
+            return;
+          }
+
+          scheduleRoomScenePresent(0);
+        },
+        { rootMargin: "160px" },
+      );
+      runtime.roomScene.intersectionObserver.observe(canvas);
+    }
+
     runtime.roomScene.watchdogId = window.setInterval(() => {
-      if (document.hidden) {
+      if (document.hidden || !runtime.roomScene.isVisible) {
         return;
       }
 
@@ -2349,12 +2377,15 @@ function startRoomScene() {
         !runtime.roomScene.rafId ||
         !runtime.roomScene.lastTimestamp ||
         now - runtime.roomScene.lastTimestamp > ROOM_SCENE_STALE_MS;
-      if (
-        !runtime.roomScene.context ||
-        frameIsStale ||
-        !roomSceneSurfaceIsHealthy()
-      ) {
+      if (!roomSceneSurfaceIsHealthy()) {
         scheduleRoomSceneSurfaceRecovery(0);
+      } else if (frameIsStale) {
+        restartRoomScene();
+      } else if (
+        !runtime.roomScene.lastPresentTimestamp ||
+        now - runtime.roomScene.lastPresentTimestamp > ROOM_SCENE_STALE_MS
+      ) {
+        scheduleRoomScenePresent(0);
       }
     }, 1200);
   }
@@ -2368,8 +2399,12 @@ function stopRoomScene() {
   runtime.roomScene.rafId = 0;
   window.clearTimeout(runtime.roomScene.recoveryTimerId);
   runtime.roomScene.recoveryTimerId = 0;
+  window.clearTimeout(runtime.roomScene.presentTimerId);
+  runtime.roomScene.presentTimerId = 0;
   window.clearInterval(runtime.roomScene.watchdogId);
   runtime.roomScene.watchdogId = 0;
+  runtime.roomScene.intersectionObserver?.disconnect();
+  runtime.roomScene.intersectionObserver = null;
 }
 
 function scheduleRoomSceneSurfaceRecovery(delay = 0) {
@@ -2380,9 +2415,111 @@ function scheduleRoomSceneSurfaceRecovery(delay = 0) {
   }, delay);
 }
 
+function scheduleRoomScenePresent(delay = 0) {
+  window.clearTimeout(runtime.roomScene.presentTimerId);
+  runtime.roomScene.presentTimerId = window.setTimeout(() => {
+    runtime.roomScene.presentTimerId = 0;
+
+    if (!refreshRoomSceneSurface()) {
+      scheduleRoomSceneSurfaceRecovery(0);
+    }
+  }, delay);
+}
+
+function ensureRoomSceneBuffer() {
+  const canvas = elements.roomCanvas;
+  if (!canvas) {
+    return null;
+  }
+
+  const width = canvas.width || 960;
+  const height = canvas.height || 600;
+  const bufferIsUsable =
+    runtime.roomScene.bufferCanvas &&
+    runtime.roomScene.bufferContext &&
+    runtime.roomScene.bufferCanvas.width === width &&
+    runtime.roomScene.bufferCanvas.height === height &&
+    !(
+      typeof runtime.roomScene.bufferContext.isContextLost === "function" &&
+      runtime.roomScene.bufferContext.isContextLost()
+    );
+
+  if (bufferIsUsable) {
+    return runtime.roomScene.bufferContext;
+  }
+
+  const bufferCanvas = document.createElement("canvas");
+  bufferCanvas.width = width;
+  bufferCanvas.height = height;
+  const bufferContext = bufferCanvas.getContext("2d", { alpha: false });
+  if (!bufferContext) {
+    return null;
+  }
+
+  bufferContext.imageSmoothingEnabled = false;
+  runtime.roomScene.bufferCanvas = bufferCanvas;
+  runtime.roomScene.bufferContext = bufferContext;
+  return bufferContext;
+}
+
+function presentRoomSceneFrame() {
+  const { bufferCanvas, context } = runtime.roomScene;
+  const canvas = elements.roomCanvas;
+  if (!canvas || !bufferCanvas || !context) {
+    return false;
+  }
+
+  if (typeof context.isContextLost === "function" && context.isContextLost()) {
+    return false;
+  }
+
+  let contextWasSaved = false;
+  try {
+    context.save();
+    contextWasSaved = true;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = "source-over";
+    context.drawImage(bufferCanvas, 0, 0, canvas.width, canvas.height);
+    runtime.roomScene.lastPresentTimestamp = performance.now();
+    return true;
+  } catch (error) {
+    if (performance.now() - runtime.roomScene.lastErrorLogTimestamp > 2000) {
+      runtime.roomScene.lastErrorLogTimestamp = performance.now();
+      console.warn("The buffered room frame could not be presented", error);
+    }
+    return false;
+  } finally {
+    if (contextWasSaved) {
+      try {
+        context.restore();
+      } catch {
+        // Context recovery will recreate the presentation surface.
+      }
+    }
+  }
+}
+
+function refreshRoomSceneSurface() {
+  if (document.hidden || !runtime.roomScene.isVisible) {
+    return true;
+  }
+
+  if (!roomSceneSurfaceIsHealthy()) {
+    return false;
+  }
+
+  if (!presentRoomSceneFrame()) {
+    return false;
+  }
+
+  ensureRoomSceneRunning();
+  return true;
+}
+
 function recoverRoomSceneSurface() {
   const canvas = elements.roomCanvas;
-  if (!canvas || document.hidden) {
+  if (!canvas || document.hidden || !runtime.roomScene.isVisible) {
     return false;
   }
 
@@ -2396,7 +2533,7 @@ function recoverRoomSceneSurface() {
   canvas.width = width;
   canvas.height = height;
 
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { alpha: false });
   if (
     !context ||
     (typeof context.isContextLost === "function" && context.isContextLost())
@@ -2408,7 +2545,9 @@ function recoverRoomSceneSurface() {
   context.imageSmoothingEnabled = false;
   runtime.roomScene.context = context;
   runtime.roomScene.lastDrawTimestamp = 0;
+  runtime.roomScene.lastPresentTimestamp = 0;
   runtime.roomScene.lastTimestamp = 0;
+  presentRoomSceneFrame();
   restartRoomScene();
   return true;
 }
@@ -2423,19 +2562,15 @@ function roomSceneSurfaceIsHealthy() {
     return false;
   }
 
-  try {
-    const pixel = context.getImageData(2, 2, 1, 1).data;
-    const isOpaque = pixel[3] > 220;
-    const isUnexpectedlyWhite =
-      pixel[0] > 245 && pixel[1] > 245 && pixel[2] > 245;
-    return isOpaque && !isUnexpectedlyWhite;
-  } catch {
-    return false;
-  }
+  return Boolean(ensureRoomSceneBuffer());
 }
 
 function restartRoomScene() {
-  if (!runtime.roomScene.context || document.hidden) {
+  if (
+    !runtime.roomScene.context ||
+    document.hidden ||
+    !runtime.roomScene.isVisible
+  ) {
     return;
   }
 
@@ -2464,7 +2599,11 @@ function ensureRoomSceneRunning(options = {}) {
     drawRoomSceneSafely(performance.now());
   }
 
-  if (!runtime.roomScene.rafId && !document.hidden) {
+  if (
+    !runtime.roomScene.rafId &&
+    !document.hidden &&
+    runtime.roomScene.isVisible
+  ) {
     queueRoomSceneFrame();
   }
 }
@@ -2473,7 +2612,8 @@ function queueRoomSceneFrame() {
   if (
     runtime.roomScene.rafId ||
     !runtime.roomScene.context ||
-    document.hidden
+    document.hidden ||
+    !runtime.roomScene.isVisible
   ) {
     return;
   }
@@ -2499,7 +2639,7 @@ function queueRoomSceneFrame() {
 }
 
 function drawRoomSceneSafely(timestamp) {
-  const context = runtime.roomScene.context;
+  const context = ensureRoomSceneBuffer();
   if (!context) {
     return;
   }
@@ -2509,6 +2649,9 @@ function drawRoomSceneSafely(timestamp) {
 
   try {
     drawRoomScene(context, timestamp / 1000);
+    if (!presentRoomSceneFrame()) {
+      scheduleRoomSceneSurfaceRecovery(0);
+    }
   } catch (error) {
     if (timestamp - runtime.roomScene.lastErrorLogTimestamp > 2000) {
       runtime.roomScene.lastErrorLogTimestamp = timestamp;

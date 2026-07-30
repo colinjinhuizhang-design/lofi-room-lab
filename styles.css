@@ -2054,6 +2054,7 @@ body {
 
 .room-scene {
   min-height: clamp(320px, 39vw, 620px);
+  contain: paint;
   border: 1px solid rgba(146, 242, 188, 0.18);
   background: #07101f;
 }
@@ -2922,6 +2923,15 @@ button:disabled {
   .room-scene {
     min-height: 0;
     aspect-ratio: 4 / 3;
+  }
+
+  .room-scene::after,
+  #screenWaveform {
+    mix-blend-mode: normal;
+  }
+
+  .room-scene::after {
+    opacity: 0.18;
   }
 
   .room-scene .room-start {
