@@ -84,19 +84,29 @@ class AudioStudioEngine {
   }
 
   async renderBackgroundLoop(sourceBuffer, session, options = {}) {
-    const duration = clamp(Number(options.duration) || 24, 12, 60);
+    const duration = Math.max(
+      1,
+      Number(options.duration) || Number(sourceBuffer.duration) || 24,
+    );
     const start = Math.max(0, Number(options.start) || 0);
     const processingDuration =
       session.mode === "remix"
         ? duration * Math.max(1, tempoRatio(session)) + 0.5
         : duration;
-    const loopSource = createLoopedAudioBuffer(
-      sourceBuffer,
-      start,
-      processingDuration,
-    );
+    const usesOriginalSource =
+      start === 0 &&
+      Math.abs(processingDuration - sourceBuffer.duration) <
+        1 / sourceBuffer.sampleRate;
+    const loopSource = usesOriginalSource
+      ? sourceBuffer
+      : createLoopedAudioBuffer(
+          sourceBuffer,
+          start,
+          processingDuration,
+        );
     const rendered = await this.renderProcessedBuffer(loopSource, {
       ...session,
+      renderProfile: "background",
       previewWindow: {
         duration,
         start: 0,
@@ -376,24 +386,30 @@ function scheduleUploadedRemixTrack(context, sourceBuffer, session, destination,
 
 function scheduleBandLayer(context, duration, session, destination, sendBus, energetic) {
   const tempo = session.beat.tempo;
-  const progression = generateChordProgression(
-    Math.max(4, Math.ceil(duration / ((60 / tempo) * 4))),
-    session.preset,
-    energetic,
-  );
-  const barDuration = (60 / tempo) * 4;
-  const rootMidi = PRESET_ROOTS[session.preset] ?? 48;
+  if (session.renderProfile !== "background") {
+    const progression = generateChordProgression(
+      Math.max(4, Math.ceil(duration / ((60 / tempo) * 4))),
+      session.preset,
+      energetic,
+    );
+    const barDuration = (60 / tempo) * 4;
+    const rootMidi = PRESET_ROOTS[session.preset] ?? 48;
 
-  for (let bar = 0; bar < progression.length; bar += 1) {
-    const chord = chordToMidiNotes(progression[bar], rootMidi);
-    const startTime = bar * barDuration;
-    if (startTime > duration) {
-      break;
+    for (let bar = 0; bar < progression.length; bar += 1) {
+      const chord = chordToMidiNotes(progression[bar], rootMidi);
+      const startTime = bar * barDuration;
+      if (startTime > duration) {
+        break;
+      }
+
+      schedulePadChord(context, chord, startTime, barDuration * 0.96, mixValue(session.mixer.chords, 0.04, energetic ? 0.22 : 0.32), destination, sendBus, energetic);
+      schedulePianoPhrase(context, chord, startTime, barDuration, tempo, mixValue(session.mixer.piano, 0.04, energetic ? 0.26 : 0.24), destination, sendBus, energetic);
+      scheduleBassline(context, chord[0] - 12, startTime, barDuration, tempo, mixValue(session.mixer.chords, 0.04, energetic ? 0.3 : 0.2), destination, energetic);
     }
+  }
 
-    schedulePadChord(context, chord, startTime, barDuration * 0.96, mixValue(session.mixer.chords, 0.04, energetic ? 0.22 : 0.32), destination, sendBus, energetic);
-    schedulePianoPhrase(context, chord, startTime, barDuration, tempo, mixValue(session.mixer.piano, 0.04, energetic ? 0.26 : 0.24), destination, sendBus, energetic);
-    scheduleBassline(context, chord[0] - 12, startTime, barDuration, tempo, mixValue(session.mixer.chords, 0.04, energetic ? 0.3 : 0.2), destination, energetic);
+  if (session.mixer.drums <= 3) {
+    return;
   }
 
   const drumBuffer = createDrumTrackBuffer(

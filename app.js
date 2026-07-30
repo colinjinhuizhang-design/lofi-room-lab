@@ -168,9 +168,6 @@ const PREVIEW_MESSAGE = "Render a whole-session preview to hear the layered mix.
 const MOBILE_ROOM_FPS = 24;
 const DESKTOP_ROOM_FPS = 60;
 const ROOM_SCENE_STALE_MS = 1800;
-const BACKGROUND_MIX_BARS = 8;
-const BACKGROUND_MIX_MIN_SECONDS = 20;
-const BACKGROUND_MIX_MAX_SECONDS = 32;
 const MEDIA_ARTWORK_BY_MOOD = {
   focus: "./assets/vinyl-dust.png",
   cozy: "./assets/cafe-air.png",
@@ -1549,7 +1546,7 @@ async function renderPreview(options = {}) {
   if (runtime.wholePreviewReady && getWholePreviewAudioElement().src) {
     runtime.livePreview.session = buildSession();
     if (runtime.playback.nativeMediaPlayback) {
-      await prepareBackgroundMix({ reportStatus: false });
+      void prepareBackgroundMix({ reportStatus: false });
     }
     if (autoplay) {
       await playAudio(getPreferredPreviewAudioElement(), { autoplayAttempt });
@@ -1588,7 +1585,7 @@ async function renderPreview(options = {}) {
     const metadataReady = await waitForAudioMetadata(elements.originalPreview);
     seekToPreviewPosition();
     if (runtime.playback.nativeMediaPlayback) {
-      await prepareBackgroundMix({ reportStatus: false });
+      void prepareBackgroundMix({ reportStatus: false });
     }
     elements.downloadLink.href = "#";
     elements.downloadLink.download = "";
@@ -1871,30 +1868,10 @@ async function prepareBackgroundMix(options = {}) {
       master: 100,
     },
   };
-  const duration = getBackgroundMixDuration(renderSession);
-  const signature = createBackgroundMixSignature(
-    sourceKey,
-    renderSession,
-    duration,
-  );
-
-  if (
-    background.active &&
-    background.signature === signature &&
-    elements.backgroundPreview.src
-  ) {
-    document.documentElement.dataset.lockScreenMix = "ready";
-    return true;
-  }
-
-  const priorAudio = getActiveAudio();
-  const sourceStart = getBackgroundMixSourceStart(priorAudio);
-  const capturedAt = performance.now();
-
   background.preparing = true;
   document.documentElement.dataset.lockScreenMix = "rendering";
-  document.documentElement.dataset.lockScreenMixSeconds =
-    duration.toFixed(1);
+  document.documentElement.dataset.lockScreenMixLength = "full-source";
+  document.documentElement.dataset.lockScreenMixProfile = "effects-only";
 
   if (options.reportStatus && options.statusMessage) {
     updateStatus(options.statusMessage, "loading");
@@ -1921,12 +1898,30 @@ async function prepareBackgroundMix(options = {}) {
       return false;
     }
 
+    const duration = getBackgroundMixDuration(sourceBuffer);
+    const signature = createBackgroundMixSignature(
+      sourceKey,
+      renderSession,
+      duration,
+    );
+    document.documentElement.dataset.lockScreenMixSeconds =
+      duration.toFixed(1);
+
+    if (
+      background.active &&
+      background.signature === signature &&
+      elements.backgroundPreview.src
+    ) {
+      document.documentElement.dataset.lockScreenMix = "ready";
+      return true;
+    }
+
     const rendered = await engine.renderBackgroundLoop(
       sourceBuffer,
       renderSession,
       {
         duration,
-        start: sourceStart,
+        start: 0,
       },
     );
 
@@ -1936,10 +1931,9 @@ async function prepareBackgroundMix(options = {}) {
 
     const audioUrl = URL.createObjectURL(engine.encodePreview(rendered));
     const installed = await installBackgroundMix(audioUrl, {
-      capturedAt,
       renderToken,
       signature,
-      sourceStart,
+      sourceStart: 0,
     });
 
     if (!installed) {
@@ -2003,6 +1997,10 @@ async function installBackgroundMix(audioUrl, options) {
   const previousPosition = Number(audio.currentTime) || 0;
   const previousWasPlaying = isAudioPlaying(audio);
   const activeBeforeInstall = getActiveAudio();
+  const activeBeforeInstallWasPlaying = isAudioPlaying(activeBeforeInstall);
+  const handoffPosition = getBackgroundMixPlaybackPosition(
+    activeBeforeInstall,
+  );
   const shouldPlay =
     activeBeforeInstall !== elements.processedPreview &&
     (runtime.playback.desiredPlaying ||
@@ -2018,14 +2016,18 @@ async function installBackgroundMix(audioUrl, options) {
   background.signature = options.signature;
   background.sourceStart = options.sourceStart;
   document.documentElement.dataset.lockScreenMix = "ready";
+  document.documentElement.dataset.lockScreenHandoffPosition =
+    handoffPosition.toFixed(3);
 
-  const elapsedSinceCapture =
-    shouldPlay
-      ? Math.max(0, (performance.now() - options.capturedAt) / 1000)
-      : 0;
-  seekAudioWhenReady(audio, elapsedSinceCapture);
+  seekAudioWhenReady(audio, handoffPosition);
 
   if (shouldPlay) {
+    for (const otherAudio of getPreviewAudioElements()) {
+      if (otherAudio !== audio) {
+        otherAudio.pause();
+      }
+    }
+
     try {
       await audio.play();
     } catch (error) {
@@ -2050,6 +2052,18 @@ async function installBackgroundMix(audioUrl, options) {
         audio.pause();
         audio.removeAttribute("src");
         audio.load();
+        if (
+          activeBeforeInstall &&
+          activeBeforeInstall !== audio &&
+          activeBeforeInstallWasPlaying &&
+          runtime.playback.desiredPlaying
+        ) {
+          try {
+            await activeBeforeInstall.play();
+          } catch {
+            // The source remains available for the next user gesture.
+          }
+        }
       }
 
       URL.revokeObjectURL(audioUrl);
@@ -2058,11 +2072,6 @@ async function installBackgroundMix(audioUrl, options) {
       return false;
     }
 
-    for (const otherAudio of getPreviewAudioElements()) {
-      if (otherAudio !== audio) {
-        otherAudio.pause();
-      }
-    }
   } else {
     audio.pause();
   }
@@ -2101,7 +2110,7 @@ function getBackgroundMixSourceKey() {
   return sourceUrl ? new URL(sourceUrl, window.location.href).href : "";
 }
 
-function getBackgroundMixSourceStart(activeAudio) {
+function getBackgroundMixPlaybackPosition(activeAudio) {
   if (
     activeAudio === elements.backgroundPreview &&
     runtime.backgroundMix.active
@@ -2122,13 +2131,8 @@ function getBackgroundMixSourceStart(activeAudio) {
   return getPreviewWindowStart();
 }
 
-function getBackgroundMixDuration(session) {
-  const barDuration = (60 / Math.max(1, session.beat.tempo)) * 4;
-  return clamp(
-    barDuration * BACKGROUND_MIX_BARS,
-    BACKGROUND_MIX_MIN_SECONDS,
-    BACKGROUND_MIX_MAX_SECONDS,
-  );
+function getBackgroundMixDuration(sourceBuffer) {
+  return Math.max(1, Number(sourceBuffer?.duration) || 1);
 }
 
 function createBackgroundMixSignature(sourceKey, session, duration) {

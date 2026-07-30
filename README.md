@@ -45,8 +45,8 @@ root with GitHub Pages. No build step is required.
 ## Audio note
 
 The 30-minute presets currently loop their selected source track during playback.
-On mobile, the current song and selected effects are rendered into a short
-bar-aligned native loop so playback can retain those effects while the browser is
-backgrounded or the screen is locked.
+On mobile, the current song and selected effects are rendered into a native mix
+matching the source track's full original duration, so playback can retain those
+effects while the browser is backgrounded or the screen is locked.
 Built-in export renders a shorter processed scene rather than a complete 30-minute
 file. See [ASSET_CREDITS.md](ASSET_CREDITS.md) for the supplied music files.
