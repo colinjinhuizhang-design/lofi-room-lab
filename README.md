@@ -12,6 +12,7 @@ export a processed mix without uploading audio to a server.
 - Interactive canvas room with rain, vinyl, drums, cafe ambience, light, and keyboard controls
 - Lo-Fi and Remix processing modes
 - Live Web Audio mixing with smooth layer fades
+- Native mobile lock-screen playback with rain, drums, dust, and cafe effects mixed in
 - Responsive desktop and mobile layout
 - Waveform playback controls and MP3/WAV export
 - Local preference persistence
@@ -44,5 +45,8 @@ root with GitHub Pages. No build step is required.
 ## Audio note
 
 The 30-minute presets currently loop their selected source track during playback.
+On mobile, the current song and selected effects are rendered into a short
+bar-aligned native loop so playback can retain those effects while the browser is
+backgrounded or the screen is locked.
 Built-in export renders a shorter processed scene rather than a complete 30-minute
 file. See [ASSET_CREDITS.md](ASSET_CREDITS.md) for the supplied music files.

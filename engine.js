@@ -42,6 +42,15 @@ class AudioStudioEngine {
     return decodeAudioData(this.getDecodeContext(), arrayBuffer);
   }
 
+  async decodeUrl(url) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Audio request failed with status ${response.status}.`);
+    }
+
+    return decodeAudioData(this.getDecodeContext(), await response.arrayBuffer());
+  }
+
   createDemoAsset() {
     const buffer = createDemoTrackBuffer(0, 16);
     const blob = encodeWav(buffer);
@@ -72,6 +81,30 @@ class AudioStudioEngine {
 
   async renderFull(sourceBuffer, session) {
     return this.renderProcessedBuffer(sourceBuffer, session);
+  }
+
+  async renderBackgroundLoop(sourceBuffer, session, options = {}) {
+    const duration = clamp(Number(options.duration) || 24, 12, 60);
+    const start = Math.max(0, Number(options.start) || 0);
+    const processingDuration =
+      session.mode === "remix"
+        ? duration * Math.max(1, tempoRatio(session)) + 0.5
+        : duration;
+    const loopSource = createLoopedAudioBuffer(
+      sourceBuffer,
+      start,
+      processingDuration,
+    );
+    const rendered = await this.renderProcessedBuffer(loopSource, {
+      ...session,
+      previewWindow: {
+        duration,
+        start: 0,
+      },
+    });
+    const exactLoop = trimAudioBuffer(rendered, duration);
+    fadeLoopBoundaries(exactLoop, 0.018);
+    return exactLoop;
   }
 
   encodePreview(buffer) {
@@ -1095,6 +1128,43 @@ function sliceAudioBuffer(sourceBuffer, startSeconds, durationSeconds) {
   return sliced;
 }
 
+function createLoopedAudioBuffer(sourceBuffer, startSeconds, durationSeconds) {
+  const sampleRate = sourceBuffer.sampleRate;
+  const channels = sourceBuffer.numberOfChannels;
+  const sourceLength = sourceBuffer.length;
+  const targetLength = Math.max(1, Math.ceil(durationSeconds * sampleRate));
+  const looped = createAudioBuffer(channels, targetLength, sampleRate);
+
+  if (!sourceLength) {
+    return looped;
+  }
+
+  const requestedStart = Math.floor(startSeconds * sampleRate);
+  const startFrame =
+    ((requestedStart % sourceLength) + sourceLength) % sourceLength;
+
+  for (let channel = 0; channel < channels; channel += 1) {
+    const sourceData = sourceBuffer.getChannelData(channel);
+    const targetData = looped.getChannelData(channel);
+    let targetOffset = 0;
+
+    while (targetOffset < targetLength) {
+      const sourceOffset = (startFrame + targetOffset) % sourceLength;
+      const copyLength = Math.min(
+        sourceLength - sourceOffset,
+        targetLength - targetOffset,
+      );
+      targetData.set(
+        sourceData.subarray(sourceOffset, sourceOffset + copyLength),
+        targetOffset,
+      );
+      targetOffset += copyLength;
+    }
+  }
+
+  return looped;
+}
+
 function trimAudioBuffer(audioBuffer, duration) {
   const sampleCount = Math.min(
     audioBuffer.length,
@@ -1113,6 +1183,22 @@ function trimAudioBuffer(audioBuffer, duration) {
   }
 
   return trimmed;
+}
+
+function fadeLoopBoundaries(audioBuffer, fadeDuration) {
+  const fadeSamples = Math.min(
+    Math.floor(audioBuffer.length / 2),
+    Math.max(1, Math.floor(fadeDuration * audioBuffer.sampleRate)),
+  );
+
+  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+    const data = audioBuffer.getChannelData(channel);
+    for (let index = 0; index < fadeSamples; index += 1) {
+      const gain = Math.sin((index / Math.max(1, fadeSamples - 1)) * Math.PI / 2);
+      data[index] *= gain;
+      data[data.length - 1 - index] *= gain;
+    }
+  }
 }
 
 function normalizeAudioBuffer(audioBuffer, targetPeak = 0.92) {

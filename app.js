@@ -168,6 +168,9 @@ const PREVIEW_MESSAGE = "Render a whole-session preview to hear the layered mix.
 const MOBILE_ROOM_FPS = 24;
 const DESKTOP_ROOM_FPS = 60;
 const ROOM_SCENE_STALE_MS = 1800;
+const BACKGROUND_MIX_BARS = 8;
+const BACKGROUND_MIX_MIN_SECONDS = 20;
+const BACKGROUND_MIX_MAX_SECONDS = 32;
 const MEDIA_ARTWORK_BY_MOOD = {
   focus: "./assets/vinyl-dust.png",
   cozy: "./assets/cafe-air.png",
@@ -181,6 +184,7 @@ const engine = new window.AudioStudioEngine();
 const elements = {
   activeSoundChips: document.getElementById("activeSoundChips"),
   appShell: document.getElementById("appShell"),
+  backgroundPreview: document.getElementById("backgroundPreview"),
   cafeCard: document.getElementById("cafeCard"),
   downloadLink: document.getElementById("downloadLink"),
   drumsCard: document.getElementById("drumsCard"),
@@ -259,6 +263,17 @@ const runtime = {
   sourceFile: null,
   sourceUrl: "",
   virtualSource: null,
+  backgroundMix: {
+    active: false,
+    audioUrl: "",
+    preparing: false,
+    renderTimerId: 0,
+    renderToken: 0,
+    signature: "",
+    sourceBuffer: null,
+    sourceKey: "",
+    sourceStart: 0,
+  },
   livePreview: {
     audio: null,
     context: null,
@@ -338,6 +353,7 @@ function init() {
     cleanupUrl("sourceUrl");
     cleanupUrl("previewUrl");
     cleanupUrl("exportUrl");
+    cleanupBackgroundMix({ clearSource: true });
     stopRoomScene();
     window.clearTimeout(runtime.livePreview.rebuildTimerId);
     runtime.livePreview.bufferCache.clear();
@@ -546,6 +562,14 @@ function bindLayerControls() {
 
       if (inputId === "previewPosition") {
         seekToPreviewPosition();
+        if (
+          runtime.playback.nativeMediaPlayback &&
+          runtime.wholePreviewReady
+        ) {
+          scheduleBackgroundMixRender(
+            "Position changed. Updating the lock-screen mix...",
+          );
+        }
       }
 
       if (!playerOnly) {
@@ -604,7 +628,7 @@ function configureBackgroundPlayback() {
     ? "playback"
     : "unavailable";
 
-  for (const audio of [elements.originalPreview, elements.processedPreview]) {
+  for (const audio of getPreviewAudioElements()) {
     audio.playsInline = true;
     audio.setAttribute("playsinline", "");
     audio.setAttribute("webkit-playsinline", "");
@@ -849,7 +873,7 @@ function bindPlayer() {
     ensureRoomSceneRunning({ redraw: true });
   };
 
-  [elements.originalPreview, elements.processedPreview].forEach((audio) => {
+  getPreviewAudioElements().forEach((audio) => {
     audio.addEventListener("loadedmetadata", () => {
       if (audio === getWholePreviewAudioElement() && runtime.wholePreviewReady) {
         seekAudioElement(audio, getPreviewWindowStart());
@@ -1076,7 +1100,9 @@ function updatePresetSourceMeta() {
   const sourceChanged = audio.src !== targetUrl;
   const shouldContinuePlaying =
     sourceChanged &&
-    (runtime.playback.desiredPlaying || isAudioPlaying(audio));
+    (runtime.playback.desiredPlaying ||
+      isAudioPlaying(audio) ||
+      isAudioPlaying(getActiveAudio()));
 
   runtime.virtualSource.duration = mood.duration;
   runtime.virtualSource.url = asset.url;
@@ -1089,6 +1115,7 @@ function updatePresetSourceMeta() {
   audio.loop = true;
 
   if (sourceChanged) {
+    cleanupBackgroundMix({ clearSource: true });
     const switchId = ++runtime.playback.sourceSwitchId;
     runtime.playback.pendingResume = shouldContinuePlaying;
     runtime.playback.desiredPlaying = shouldContinuePlaying;
@@ -1487,6 +1514,13 @@ function schedulePreview(message) {
   if (runtime.wholePreviewReady) {
     const session = buildSession();
     runtime.livePreview.session = session;
+    if (runtime.playback.nativeMediaPlayback) {
+      scheduleBackgroundMixRender(message);
+      updateSummary();
+      syncPlayerState();
+      return;
+    }
+
     if (needsLivePreviewRebuild(session)) {
       smoothRebuildLivePreviewGraph(session);
     } else {
@@ -1514,8 +1548,11 @@ async function renderPreview(options = {}) {
 
   if (runtime.wholePreviewReady && getWholePreviewAudioElement().src) {
     runtime.livePreview.session = buildSession();
+    if (runtime.playback.nativeMediaPlayback) {
+      await prepareBackgroundMix({ reportStatus: false });
+    }
     if (autoplay) {
-      await playAudio(getWholePreviewAudioElement(), { autoplayAttempt });
+      await playAudio(getPreferredPreviewAudioElement(), { autoplayAttempt });
     } else {
       syncPlayerState();
     }
@@ -1550,6 +1587,9 @@ async function renderPreview(options = {}) {
     }
     const metadataReady = await waitForAudioMetadata(elements.originalPreview);
     seekToPreviewPosition();
+    if (runtime.playback.nativeMediaPlayback) {
+      await prepareBackgroundMix({ reportStatus: false });
+    }
     elements.downloadLink.href = "#";
     elements.downloadLink.download = "";
     elements.downloadLink.classList.add("is-disabled");
@@ -1565,7 +1605,7 @@ async function renderPreview(options = {}) {
     }
 
     if (autoplay) {
-      await playAudio(getWholePreviewAudioElement(), { autoplayAttempt });
+      await playAudio(getPreferredPreviewAudioElement(), { autoplayAttempt });
     } else {
       syncPlayerState();
     }
@@ -1697,6 +1737,26 @@ function getWholePreviewAudioElement() {
   return elements.originalPreview;
 }
 
+function getPreferredPreviewAudioElement() {
+  if (
+    runtime.playback.nativeMediaPlayback &&
+    runtime.backgroundMix.active &&
+    elements.backgroundPreview.src
+  ) {
+    return elements.backgroundPreview;
+  }
+
+  return getWholePreviewAudioElement();
+}
+
+function getPreviewAudioElements() {
+  return [
+    elements.originalPreview,
+    elements.backgroundPreview,
+    elements.processedPreview,
+  ].filter(Boolean);
+}
+
 function getPreviewWindowStart() {
   if (!hasSourceTrack()) {
     return 0;
@@ -1709,6 +1769,7 @@ function getPreviewWindowStart() {
 function cleanupRenderedOutputs() {
   cleanupUrl("previewUrl");
   cleanupUrl("exportUrl");
+  cleanupBackgroundMix({ clearSource: true });
   cleanupLivePreviewGraph();
   runtime.wholePreviewReady = false;
   elements.processedPreview.removeAttribute("src");
@@ -1728,6 +1789,354 @@ function cleanupUrl(key) {
     }
     runtime[key] = "";
   }
+}
+
+function cleanupBackgroundMix(options = {}) {
+  const { clearSource = false } = options;
+  const background = runtime.backgroundMix;
+  window.clearTimeout(background.renderTimerId);
+  background.renderTimerId = 0;
+  background.renderToken += 1;
+  background.preparing = false;
+  background.active = false;
+  background.signature = "";
+  background.sourceStart = 0;
+
+  elements.backgroundPreview.pause();
+  elements.backgroundPreview.removeAttribute("src");
+  elements.backgroundPreview.load();
+
+  if (background.audioUrl) {
+    URL.revokeObjectURL(background.audioUrl);
+    background.audioUrl = "";
+  }
+
+  if (clearSource) {
+    background.sourceBuffer = null;
+    background.sourceKey = "";
+  }
+
+  document.documentElement.dataset.lockScreenMix =
+    runtime.playback.nativeMediaPlayback ? "pending" : "not-required";
+}
+
+function scheduleBackgroundMixRender(message = "") {
+  if (!runtime.playback.nativeMediaPlayback || !hasSourceTrack()) {
+    return;
+  }
+
+  const background = runtime.backgroundMix;
+  window.clearTimeout(background.renderTimerId);
+  const renderToken = ++background.renderToken;
+  document.documentElement.dataset.lockScreenMix = "pending";
+
+  background.renderTimerId = window.setTimeout(() => {
+    background.renderTimerId = 0;
+    void prepareBackgroundMix({
+      renderToken,
+      reportStatus: true,
+      statusMessage: message,
+    });
+  }, 420);
+}
+
+async function prepareBackgroundMix(options = {}) {
+  if (!runtime.playback.nativeMediaPlayback || !hasSourceTrack()) {
+    return false;
+  }
+
+  const background = runtime.backgroundMix;
+  const renderToken =
+    Number.isInteger(options.renderToken)
+      ? options.renderToken
+      : ++background.renderToken;
+
+  if (renderToken !== background.renderToken) {
+    return false;
+  }
+
+  window.clearTimeout(background.renderTimerId);
+  background.renderTimerId = 0;
+
+  const sourceKey = getBackgroundMixSourceKey();
+  if (!sourceKey) {
+    return false;
+  }
+
+  const session = buildSession();
+  const renderSession = {
+    ...session,
+    mixer: {
+      ...session.mixer,
+      master: 100,
+    },
+  };
+  const duration = getBackgroundMixDuration(renderSession);
+  const signature = createBackgroundMixSignature(
+    sourceKey,
+    renderSession,
+    duration,
+  );
+
+  if (
+    background.active &&
+    background.signature === signature &&
+    elements.backgroundPreview.src
+  ) {
+    document.documentElement.dataset.lockScreenMix = "ready";
+    return true;
+  }
+
+  const priorAudio = getActiveAudio();
+  const sourceStart = getBackgroundMixSourceStart(priorAudio);
+  const capturedAt = performance.now();
+
+  background.preparing = true;
+  document.documentElement.dataset.lockScreenMix = "rendering";
+  document.documentElement.dataset.lockScreenMixSeconds =
+    duration.toFixed(1);
+
+  if (options.reportStatus && options.statusMessage) {
+    updateStatus(options.statusMessage, "loading");
+  }
+
+  try {
+    let sourceBuffer;
+    if (runtime.sourceBuffer) {
+      sourceBuffer = runtime.sourceBuffer;
+    } else if (
+      background.sourceBuffer &&
+      background.sourceKey === sourceKey
+    ) {
+      sourceBuffer = background.sourceBuffer;
+    } else {
+      sourceBuffer = await engine.decodeUrl(sourceKey);
+      if (getBackgroundMixSourceKey() === sourceKey) {
+        background.sourceBuffer = sourceBuffer;
+        background.sourceKey = sourceKey;
+      }
+    }
+
+    if (renderToken !== background.renderToken) {
+      return false;
+    }
+
+    const rendered = await engine.renderBackgroundLoop(
+      sourceBuffer,
+      renderSession,
+      {
+        duration,
+        start: sourceStart,
+      },
+    );
+
+    if (renderToken !== background.renderToken) {
+      return false;
+    }
+
+    const audioUrl = URL.createObjectURL(engine.encodePreview(rendered));
+    const installed = await installBackgroundMix(audioUrl, {
+      capturedAt,
+      renderToken,
+      signature,
+      sourceStart,
+    });
+
+    if (!installed) {
+      return false;
+    }
+
+    cleanupLivePreviewGraph();
+    if (options.reportStatus) {
+      updateStatus(
+        isAudioPlaying(elements.backgroundPreview)
+          ? "Room is playing with the selected lock-screen effects."
+          : "Lock-screen mix is ready with the selected effects.",
+        "success",
+      );
+    }
+    updateSummary();
+    syncPlayerState();
+    return true;
+  } catch (error) {
+    console.warn("Lock-screen effect mix could not be prepared", error);
+    if (renderToken === background.renderToken) {
+      document.documentElement.dataset.lockScreenMix = "fallback";
+      if (options.reportStatus) {
+        updateStatus(
+          "Base playback is ready, but the lock-screen effects could not be updated.",
+          "error",
+        );
+      }
+    }
+    return false;
+  } finally {
+    if (renderToken === background.renderToken) {
+      background.preparing = false;
+    }
+  }
+}
+
+async function installBackgroundMix(audioUrl, options) {
+  const background = runtime.backgroundMix;
+  const candidate = document.createElement("audio");
+  candidate.preload = "auto";
+  candidate.src = audioUrl;
+  candidate.load();
+  const candidateReady = await waitForAudioMetadata(candidate, 8000);
+  candidate.removeAttribute("src");
+  candidate.load();
+
+  if (
+    !candidateReady ||
+    options.renderToken !== background.renderToken
+  ) {
+    URL.revokeObjectURL(audioUrl);
+    return false;
+  }
+
+  const audio = elements.backgroundPreview;
+  const previousUrl = background.audioUrl;
+  const previousSignature = background.signature;
+  const previousSourceStart = background.sourceStart;
+  const previousActive = background.active;
+  const previousPosition = Number(audio.currentTime) || 0;
+  const previousWasPlaying = isAudioPlaying(audio);
+  const activeBeforeInstall = getActiveAudio();
+  const shouldPlay =
+    activeBeforeInstall !== elements.processedPreview &&
+    (runtime.playback.desiredPlaying ||
+      isAudioPlaying(activeBeforeInstall));
+
+  audio.loop = true;
+  audio.preload = "auto";
+  audio.src = audioUrl;
+  audio.load();
+
+  background.active = true;
+  background.audioUrl = audioUrl;
+  background.signature = options.signature;
+  background.sourceStart = options.sourceStart;
+  document.documentElement.dataset.lockScreenMix = "ready";
+
+  const elapsedSinceCapture =
+    shouldPlay
+      ? Math.max(0, (performance.now() - options.capturedAt) / 1000)
+      : 0;
+  seekAudioWhenReady(audio, elapsedSinceCapture);
+
+  if (shouldPlay) {
+    try {
+      await audio.play();
+    } catch (error) {
+      console.warn("The prepared lock-screen mix could not take over playback", error);
+      background.active = previousActive;
+      background.audioUrl = previousUrl;
+      background.signature = previousSignature;
+      background.sourceStart = previousSourceStart;
+
+      if (previousUrl) {
+        audio.src = previousUrl;
+        audio.load();
+        seekAudioWhenReady(audio, previousPosition);
+        if (previousWasPlaying && runtime.playback.desiredPlaying) {
+          try {
+            await audio.play();
+          } catch {
+            // The original source remains available for the next user gesture.
+          }
+        }
+      } else {
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      }
+
+      URL.revokeObjectURL(audioUrl);
+      document.documentElement.dataset.lockScreenMix =
+        previousActive ? "ready" : "fallback";
+      return false;
+    }
+
+    for (const otherAudio of getPreviewAudioElements()) {
+      if (otherAudio !== audio) {
+        otherAudio.pause();
+      }
+    }
+  } else {
+    audio.pause();
+  }
+
+  if (previousUrl && previousUrl !== audioUrl) {
+    URL.revokeObjectURL(previousUrl);
+  }
+
+  runtime.mediaSession.lastPositionUpdate = 0;
+  return true;
+}
+
+function seekAudioWhenReady(audio, targetTime) {
+  const applySeek = () => {
+    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+      seekAudioElement(audio, targetTime % audio.duration);
+    }
+  };
+
+  if (audio.readyState >= 1) {
+    applySeek();
+    return;
+  }
+
+  audio.addEventListener("loadedmetadata", applySeek, { once: true });
+}
+
+function getBackgroundMixSourceKey() {
+  if (runtime.sourceBuffer) {
+    return String(
+      runtime.sourceUrl || runtime.sourceFile?.name || "uploaded-source",
+    );
+  }
+
+  const sourceUrl = getWholePreviewSourceUrl();
+  return sourceUrl ? new URL(sourceUrl, window.location.href).href : "";
+}
+
+function getBackgroundMixSourceStart(activeAudio) {
+  if (
+    activeAudio === elements.backgroundPreview &&
+    runtime.backgroundMix.active
+  ) {
+    return (
+      runtime.backgroundMix.sourceStart +
+      (Number(activeAudio.currentTime) || 0)
+    );
+  }
+
+  if (
+    activeAudio === elements.originalPreview &&
+    Number.isFinite(activeAudio.currentTime)
+  ) {
+    return activeAudio.currentTime;
+  }
+
+  return getPreviewWindowStart();
+}
+
+function getBackgroundMixDuration(session) {
+  const barDuration = (60 / Math.max(1, session.beat.tempo)) * 4;
+  return clamp(
+    barDuration * BACKGROUND_MIX_BARS,
+    BACKGROUND_MIX_MIN_SECONDS,
+    BACKGROUND_MIX_MAX_SECONDS,
+  );
+}
+
+function createBackgroundMixSignature(sourceKey, session, duration) {
+  return JSON.stringify({
+    sourceKey,
+    duration: Number(duration.toFixed(3)),
+    session,
+  });
 }
 
 async function prepareLivePreviewGraph(session) {
@@ -2219,9 +2628,13 @@ function seekToPreviewPosition() {
   }
 
   const targetTime = getPreviewWindowStart();
-  for (const audio of [elements.originalPreview, elements.processedPreview]) {
+  for (const audio of getPreviewAudioElements()) {
     if (audio.src && Number.isFinite(audio.duration) && audio.duration > 0) {
-      seekAudioElement(audio, targetTime);
+      const audioTarget =
+        audio === elements.backgroundPreview
+          ? targetTime % audio.duration
+          : targetTime;
+      seekAudioElement(audio, audioTarget);
     }
   }
 
@@ -2276,6 +2689,10 @@ function getActiveAudio() {
     return elements.processedPreview;
   }
 
+  if (runtime.backgroundMix.active && elements.backgroundPreview.src) {
+    return elements.backgroundPreview;
+  }
+
   if (elements.originalPreview.src) {
     return elements.originalPreview;
   }
@@ -2304,7 +2721,11 @@ function getActivePlaybackDuration(audio) {
     return 0;
   }
 
-  if (runtime.wholePreviewReady && audio === getWholePreviewAudioElement()) {
+  if (
+    runtime.wholePreviewReady &&
+    (audio === getWholePreviewAudioElement() ||
+      audio === elements.backgroundPreview)
+  ) {
     return getSourceDuration();
   }
 
@@ -2334,10 +2755,17 @@ async function playAudio(audio, options = {}) {
   ensureRoomSceneRunning({ redraw: true });
 
   try {
-    const otherAudio = audio === elements.originalPreview ? elements.processedPreview : elements.originalPreview;
-    otherAudio.pause();
+    for (const otherAudio of getPreviewAudioElements()) {
+      if (otherAudio !== audio) {
+        otherAudio.pause();
+      }
+    }
 
-    const shouldUseLiveLayers = audio === getWholePreviewAudioElement() && runtime.wholePreviewReady;
+    const shouldUseLiveLayers =
+      audio === getWholePreviewAudioElement() &&
+      runtime.wholePreviewReady &&
+      (!runtime.playback.nativeMediaPlayback ||
+        !runtime.backgroundMix.active);
     const session = shouldUseLiveLayers ? runtime.livePreview.session || buildSession() : null;
     await audio.play();
     syncPlayerState();
