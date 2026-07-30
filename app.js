@@ -168,6 +168,13 @@ const PREVIEW_MESSAGE = "Render a whole-session preview to hear the layered mix.
 const MOBILE_ROOM_FPS = 24;
 const DESKTOP_ROOM_FPS = 60;
 const ROOM_SCENE_STALE_MS = 1800;
+const MEDIA_ARTWORK_BY_MOOD = {
+  focus: "./assets/vinyl-dust.png",
+  cozy: "./assets/cafe-air.png",
+  smooth: "./assets/boom-bap.png",
+  mountain: "./assets/rain-room.png",
+  pretty: "./assets/source-mic.png",
+};
 
 const engine = new window.AudioStudioEngine();
 
@@ -269,8 +276,12 @@ const runtime = {
   playback: {
     autoplayBlocked: false,
     desiredPlaying: false,
+    nativeMediaPlayback: false,
     pendingResume: false,
     sourceSwitchId: 0,
+  },
+  mediaSession: {
+    lastPositionUpdate: 0,
   },
   roomScene: {
     bufferCanvas: null,
@@ -298,6 +309,7 @@ init();
 function init() {
   hydrateControls();
   seedLayerMemory();
+  configureBackgroundPlayback();
   bindToolbar();
   bindSourceCard();
   bindRoomControls();
@@ -582,6 +594,254 @@ function bindActions() {
   });
 }
 
+function configureBackgroundPlayback() {
+  runtime.playback.nativeMediaPlayback = usesNativeBackgroundPlaybackProfile();
+  document.documentElement.dataset.backgroundPlayback =
+    runtime.playback.nativeMediaPlayback ? "native-media" : "web-audio";
+  document.documentElement.dataset.mediaSession =
+    "mediaSession" in navigator ? "available" : "unavailable";
+  document.documentElement.dataset.audioSession = navigator.audioSession
+    ? "playback"
+    : "unavailable";
+
+  for (const audio of [elements.originalPreview, elements.processedPreview]) {
+    audio.playsInline = true;
+    audio.setAttribute("playsinline", "");
+    audio.setAttribute("webkit-playsinline", "");
+    audio.dataset.backgroundPlayback = document.documentElement.dataset.backgroundPlayback;
+  }
+
+  setPlaybackAudioSessionType();
+
+  if (navigator.audioSession?.addEventListener) {
+    navigator.audioSession.addEventListener("statechange", () => {
+      if (
+        navigator.audioSession.state === "active" &&
+        runtime.playback.desiredPlaying
+      ) {
+        const audio = getActiveAudio();
+        if (audio?.paused) {
+          void resumeNativeBackgroundPlayback(audio);
+        }
+      }
+    });
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (
+      document.hidden &&
+      runtime.playback.nativeMediaPlayback &&
+      runtime.livePreview.context?.state === "running"
+    ) {
+      runtime.livePreview.context.suspend().catch(() => {});
+    }
+  });
+
+  if (!("mediaSession" in navigator)) {
+    return;
+  }
+
+  const actionHandlers = {
+    play: () => {
+      const audio = getActiveAudio();
+      if (audio) {
+        void playAudio(audio);
+      }
+    },
+    pause: () => pauseActiveAudio(),
+    stop: () => pauseActiveAudio({ resetPosition: true }),
+    seekbackward: (details) => {
+      seekActiveAudioBy(-(details?.seekOffset || 10));
+    },
+    seekforward: (details) => {
+      seekActiveAudioBy(details?.seekOffset || 10);
+    },
+    seekto: (details) => {
+      if (Number.isFinite(details?.seekTime)) {
+        seekActiveAudioTo(details.seekTime);
+      }
+    },
+    previoustrack: () => cycleMoodByOffset(-1),
+    nexttrack: () => cycleMoodByOffset(1),
+  };
+
+  for (const [action, handler] of Object.entries(actionHandlers)) {
+    try {
+      navigator.mediaSession.setActionHandler(action, handler);
+    } catch {
+      // Browsers expose different subsets of Media Session actions.
+    }
+  }
+
+  updateMediaSessionMetadata();
+  syncMediaSessionState(getActiveAudio(), { forcePosition: true });
+}
+
+function setPlaybackAudioSessionType() {
+  if (!navigator.audioSession) {
+    return;
+  }
+
+  try {
+    navigator.audioSession.type = "playback";
+  } catch {
+    // Audio Session is experimental and may be present without a writable type.
+  }
+}
+
+async function resumeNativeBackgroundPlayback(audio) {
+  setPlaybackAudioSessionType();
+  audio.preload = "auto";
+
+  try {
+    await audio.play();
+    runtime.playback.autoplayBlocked = false;
+    syncPlayerState();
+    tickWaveforms();
+  } catch {
+    // The lock-screen control remains available for another user-initiated attempt.
+  }
+}
+
+function pauseActiveAudio(options = {}) {
+  const { resetPosition = false } = options;
+  const audio = getActiveAudio();
+  runtime.playback.desiredPlaying = false;
+  runtime.playback.pendingResume = false;
+  runtime.playback.sourceSwitchId += 1;
+
+  if (!audio) {
+    syncMediaSessionState(null, { forcePosition: true });
+    return;
+  }
+
+  audio.pause();
+  if (resetPosition) {
+    seekAudioElement(audio, 0);
+  }
+  runtime.mediaSession.lastPositionUpdate = 0;
+  syncPlayerState();
+}
+
+function seekActiveAudioBy(offset) {
+  const audio = getActiveAudio();
+  if (!audio || !Number.isFinite(audio.currentTime)) {
+    return;
+  }
+  seekActiveAudioTo(audio.currentTime + offset);
+}
+
+function seekActiveAudioTo(targetTime) {
+  const audio = getActiveAudio();
+  if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) {
+    return;
+  }
+
+  seekAudioElement(audio, targetTime);
+  runtime.mediaSession.lastPositionUpdate = 0;
+  syncPlayerState();
+  drawWaveforms();
+}
+
+function cycleMoodByOffset(offset) {
+  const currentIndex = MOOD_ORDER.indexOf(runtime.state.mood);
+  const nextIndex =
+    (currentIndex + offset + MOOD_ORDER.length) % MOOD_ORDER.length;
+  applyMood(MOOD_ORDER[nextIndex], {
+    preserveTheme: false,
+    schedule: true,
+    resetPosition: true,
+  });
+}
+
+function updateMediaSessionMetadata(title = "") {
+  const mood = currentMood();
+  const artworkPath =
+    MEDIA_ARTWORK_BY_MOOD[runtime.state.mood] ?? MEDIA_ARTWORK_BY_MOOD.focus;
+  const displayTitle = String(
+    title || runtime.sourceFile?.name || mood.label,
+  ).replace(/\.[^.]+$/, "");
+  document.documentElement.dataset.mediaTitle = displayTitle;
+
+  if (
+    !("mediaSession" in navigator) ||
+    typeof window.MediaMetadata !== "function"
+  ) {
+    return;
+  }
+
+  try {
+    navigator.mediaSession.metadata = new window.MediaMetadata({
+      title: displayTitle,
+      artist: "Lo-Fi Room Lab",
+      album: `${mood.lengthLabel} / ${runtime.state.beatTempo} BPM`,
+      artwork: [
+        {
+          src: new URL(artworkPath, window.location.href).href,
+          type: "image/png",
+        },
+      ],
+    });
+  } catch {
+    // Playback remains functional when a browser rejects custom metadata.
+  }
+}
+
+function syncMediaSessionState(audio, options = {}) {
+  const playbackState = !audio?.src
+    ? "none"
+    : isAudioPlaying(audio)
+      ? "playing"
+      : "paused";
+  document.documentElement.dataset.mediaPlaybackState = playbackState;
+
+  if (!("mediaSession" in navigator)) {
+    return;
+  }
+
+  const { forcePosition = false } = options;
+  try {
+    navigator.mediaSession.playbackState = playbackState;
+  } catch {
+    return;
+  }
+
+  const now = Date.now();
+  if (
+    !forcePosition &&
+    runtime.mediaSession.lastPositionUpdate &&
+    now - runtime.mediaSession.lastPositionUpdate < 1000
+  ) {
+    return;
+  }
+
+  if (
+    !audio ||
+    !Number.isFinite(audio.duration) ||
+    audio.duration <= 0 ||
+    typeof navigator.mediaSession.setPositionState !== "function"
+  ) {
+    try {
+      navigator.mediaSession.setPositionState?.();
+    } catch {
+      // Position state is optional.
+    }
+    runtime.mediaSession.lastPositionUpdate = now;
+    return;
+  }
+
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: audio.duration,
+      playbackRate: audio.playbackRate || 1,
+      position: clamp(audio.currentTime, 0, audio.duration),
+    });
+    runtime.mediaSession.lastPositionUpdate = now;
+  } catch {
+    // Some browsers expose Media Session without position-state support.
+  }
+}
+
 function bindPlayer() {
   const onStateChange = () => {
     syncPlayerState();
@@ -594,18 +854,24 @@ function bindPlayer() {
       if (audio === getWholePreviewAudioElement() && runtime.wholePreviewReady) {
         seekAudioElement(audio, getPreviewWindowStart());
       }
+      runtime.mediaSession.lastPositionUpdate = 0;
       onStateChange();
     });
     audio.addEventListener("play", () => {
       runtime.playback.desiredPlaying = true;
       runtime.playback.autoplayBlocked = false;
+      runtime.mediaSession.lastPositionUpdate = 0;
       syncPlayerState();
       tickWaveforms();
       ensureRoomSceneRunning({ redraw: true });
     });
-    audio.addEventListener("pause", onStateChange);
+    audio.addEventListener("pause", () => {
+      runtime.mediaSession.lastPositionUpdate = 0;
+      onStateChange();
+    });
     audio.addEventListener("ended", () => {
       runtime.playback.desiredPlaying = false;
+      runtime.mediaSession.lastPositionUpdate = 0;
       onStateChange();
     });
     audio.addEventListener("timeupdate", onStateChange);
@@ -1125,6 +1391,7 @@ function renderSourceMeta(name, duration, size, sizeLabel = "") {
   elements.fileDuration.textContent = formatTime(duration);
   elements.fileSize.textContent = sizeLabel || (typeof size === "number" && size > 0 ? formatBytes(size) : "--");
   updateTransportMeta();
+  updateMediaSessionMetadata(name);
 }
 
 async function loadMoodAudioAsset() {
@@ -1466,6 +1733,7 @@ function cleanupUrl(key) {
 async function prepareLivePreviewGraph(session) {
   const context = getLiveAudioContext();
   const audio = getWholePreviewAudioElement();
+  const nativeMediaPlayback = runtime.playback.nativeMediaPlayback;
 
   if (context.state === "suspended") {
     await context.resume();
@@ -1473,11 +1741,14 @@ async function prepareLivePreviewGraph(session) {
 
   cleanupLivePreviewGraph();
 
-  if (!runtime.livePreview.mediaSource || runtime.livePreview.audio !== audio) {
+  if (
+    !nativeMediaPlayback &&
+    (!runtime.livePreview.mediaSource || runtime.livePreview.audio !== audio)
+  ) {
     runtime.livePreview.mediaSource = context.createMediaElementSource(audio);
-    runtime.livePreview.audio = audio;
   }
 
+  runtime.livePreview.audio = audio;
   runtime.livePreview.session = session;
 
   const sourceGain = context.createGain();
@@ -1529,20 +1800,22 @@ async function prepareLivePreviewGraph(session) {
   outputLimiter.attack.value = 0.004;
   outputLimiter.release.value = 0.12;
 
-  runtime.livePreview.mediaSource
-    .connect(sourceGain)
-    .connect(highpass)
-    .connect(lowpass)
-    .connect(saturation)
-    .connect(compressor)
-    .connect(master)
-    .connect(outputLimiter)
-    .connect(context.destination);
-
-  sourceGain.connect(delay);
-  delay.connect(feedback).connect(delay);
-  delay.connect(wetGain).connect(master);
+  master.connect(outputLimiter).connect(context.destination);
   layerBus.connect(master);
+
+  if (!nativeMediaPlayback && runtime.livePreview.mediaSource) {
+    runtime.livePreview.mediaSource
+      .connect(sourceGain)
+      .connect(highpass)
+      .connect(lowpass)
+      .connect(saturation)
+      .connect(compressor)
+      .connect(master);
+
+    sourceGain.connect(delay);
+    delay.connect(feedback).connect(delay);
+    delay.connect(wetGain).connect(master);
+  }
 
   runtime.livePreview.layerBus = layerBus;
   runtime.livePreview.nodes.push(
@@ -2048,10 +2321,7 @@ async function togglePlayer() {
   if (activeAudio.paused) {
     await playAudio(activeAudio);
   } else {
-    runtime.playback.desiredPlaying = false;
-    runtime.playback.pendingResume = false;
-    runtime.playback.sourceSwitchId += 1;
-    activeAudio.pause();
+    pauseActiveAudio();
   }
 }
 
@@ -2059,6 +2329,8 @@ async function playAudio(audio, options = {}) {
   const { autoplayAttempt = false } = options;
   runtime.playback.desiredPlaying = true;
   runtime.playback.pendingResume = false;
+  setPlaybackAudioSessionType();
+  audio.preload = "auto";
   ensureRoomSceneRunning({ redraw: true });
 
   try {
@@ -2123,6 +2395,7 @@ function syncPlayerState() {
   elements.playPauseButton.disabled = disabled;
   elements.playPauseButton.textContent = activeAudio && !activeAudio.paused ? "Pause" : "Play";
   updateRoomUi();
+  syncMediaSessionState(activeAudio);
 
   const playbackDuration = getActivePlaybackDuration(activeAudio);
   if (!activeAudio || !Number.isFinite(playbackDuration) || playbackDuration <= 0) {
@@ -2136,7 +2409,14 @@ function syncPlayerState() {
     seekAudioElement(activeAudio, playbackDuration);
   }
 
-  activeAudio.volume = clamp(runtime.state.mixMaster, 0, 100) / 100;
+  const sourceMix =
+    runtime.playback.nativeMediaPlayback &&
+    activeAudio === getWholePreviewAudioElement() &&
+    runtime.wholePreviewReady
+      ? clamp(runtime.state.mixUpload, 0, 100) / 100
+      : 1;
+  activeAudio.volume =
+    (clamp(runtime.state.mixMaster, 0, 100) / 100) * sourceMix;
   const ratio = clamp(activeAudio.currentTime / playbackDuration, 0, 1);
   elements.seekSlider.value = String(Math.round(ratio * 1000));
   elements.timelineReadout.textContent = `${formatTime(Math.min(activeAudio.currentTime, playbackDuration))} / ${formatTime(playbackDuration)}`;
@@ -2279,6 +2559,13 @@ function usesMobileRenderingProfile() {
   const hardwareConcurrency = Number(navigator.hardwareConcurrency) || 0;
   const constrainedCpu = hardwareConcurrency > 0 && hardwareConcurrency <= 4;
   return coarsePointer || compactViewport || constrainedCpu;
+}
+
+function usesNativeBackgroundPlaybackProfile() {
+  const coarsePointer =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  return coarsePointer || window.innerWidth <= 720;
 }
 
 function getRoomFrameInterval() {
