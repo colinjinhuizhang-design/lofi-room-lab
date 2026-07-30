@@ -165,6 +165,9 @@ const CHIP_META = {
 };
 
 const PREVIEW_MESSAGE = "Render a whole-session preview to hear the layered mix.";
+const MOBILE_ROOM_FPS = 30;
+const DESKTOP_ROOM_FPS = 60;
+const ROOM_SCENE_STALE_MS = 1800;
 
 const engine = new window.AudioStudioEngine();
 
@@ -244,6 +247,7 @@ const runtime = {
   previewUrl: "",
   wholePreviewReady: false,
   rafId: 0,
+  lastPlayerFrameTimestamp: 0,
   sourceBuffer: null,
   sourceFile: null,
   sourceUrl: "",
@@ -258,11 +262,26 @@ const runtime = {
     controls: null,
     signature: "",
     session: null,
+    bufferCache: new Map(),
+    rebuildTimerId: 0,
+    rebuildToken: 0,
+  },
+  playback: {
+    autoplayBlocked: false,
+    desiredPlaying: false,
+    pendingResume: false,
+    sourceSwitchId: 0,
   },
   roomScene: {
+    context: null,
+    generation: 0,
+    lastDrawTimestamp: 0,
+    lastErrorLogTimestamp: 0,
     rafId: 0,
     lastTimestamp: 0,
+    listenersBound: false,
     pointer: { x: -1, y: -1 },
+    watchdogId: 0,
   },
   state: loadPersistedState(),
 };
@@ -300,7 +319,12 @@ function init() {
     cleanupUrl("sourceUrl");
     cleanupUrl("previewUrl");
     cleanupUrl("exportUrl");
-    cancelAnimationFrame(runtime.roomScene.rafId);
+    stopRoomScene();
+    window.clearTimeout(runtime.livePreview.rebuildTimerId);
+    runtime.livePreview.bufferCache.clear();
+    if (runtime.livePreview.context && runtime.livePreview.context.state !== "closed") {
+      runtime.livePreview.context.close().catch(() => {});
+    }
     engine.dispose();
   });
 }
@@ -555,6 +579,7 @@ function bindPlayer() {
   const onStateChange = () => {
     syncPlayerState();
     drawWaveforms();
+    ensureRoomSceneRunning({ redraw: true });
   };
 
   [elements.originalPreview, elements.processedPreview].forEach((audio) => {
@@ -565,11 +590,17 @@ function bindPlayer() {
       onStateChange();
     });
     audio.addEventListener("play", () => {
+      runtime.playback.desiredPlaying = true;
+      runtime.playback.autoplayBlocked = false;
       syncPlayerState();
       tickWaveforms();
+      ensureRoomSceneRunning({ redraw: true });
     });
     audio.addEventListener("pause", onStateChange);
-    audio.addEventListener("ended", onStateChange);
+    audio.addEventListener("ended", () => {
+      runtime.playback.desiredPlaying = false;
+      onStateChange();
+    });
     audio.addEventListener("timeupdate", onStateChange);
   });
 
@@ -648,6 +679,7 @@ function randomizeMix() {
   seekToPreviewPosition();
   syncPlayerState();
   persistState();
+  ensureRoomSceneRunning({ redraw: true });
   schedulePreview("Mix shuffled. Fading into the new take...");
 }
 
@@ -712,6 +744,7 @@ function applyMood(moodId, options = {}) {
   seekToPreviewPosition();
   syncPlayerState();
   persistState();
+  ensureRoomSceneRunning({ redraw: true });
 
   if (schedule) {
     schedulePreview(`${mood.label} is fading in smoothly...`);
@@ -765,6 +798,13 @@ function updatePresetSourceMeta() {
 
   const mood = currentMood();
   const asset = TRACK_ASSETS[runtime.state.mood] ?? TRACK_ASSETS.focus;
+  const audio = elements.originalPreview;
+  const targetUrl = new URL(asset.url, window.location.href).href;
+  const sourceChanged = audio.src !== targetUrl;
+  const shouldContinuePlaying =
+    sourceChanged &&
+    (runtime.playback.desiredPlaying || isAudioPlaying(audio));
+
   runtime.virtualSource.duration = mood.duration;
   runtime.virtualSource.url = asset.url;
   runtime.sourceUrl = asset.url;
@@ -773,12 +813,57 @@ function updatePresetSourceMeta() {
     size: asset.size,
     type: asset.type,
   };
-  elements.originalPreview.loop = true;
-  if (elements.originalPreview.src !== new URL(asset.url, window.location.href).href) {
-    elements.originalPreview.src = asset.url;
-    elements.originalPreview.load();
+  audio.loop = true;
+
+  if (sourceChanged) {
+    const switchId = ++runtime.playback.sourceSwitchId;
+    runtime.playback.pendingResume = shouldContinuePlaying;
+    runtime.playback.desiredPlaying = shouldContinuePlaying;
+    audio.preload = shouldContinuePlaying ? "auto" : "metadata";
+    audio.src = asset.url;
+    audio.load();
+
+    if (shouldContinuePlaying) {
+      void continuePlaybackAfterSourceSwitch(audio, switchId, mood.label);
+    }
   }
+
   renderSourceMeta(mood.label, mood.duration, asset.size, mood.lengthLabel);
+}
+
+async function continuePlaybackAfterSourceSwitch(audio, switchId, moodLabel) {
+  try {
+    await audio.play();
+
+    if (
+      switchId !== runtime.playback.sourceSwitchId ||
+      !runtime.playback.desiredPlaying
+    ) {
+      return false;
+    }
+
+    runtime.playback.pendingResume = false;
+    runtime.playback.autoplayBlocked = false;
+    updateStatus(`${moodLabel} is playing.`, "success");
+    syncPlayerState();
+    tickWaveforms();
+    ensureRoomSceneRunning({ redraw: true });
+    return true;
+  } catch (error) {
+    if (
+      switchId !== runtime.playback.sourceSwitchId ||
+      !runtime.playback.desiredPlaying
+    ) {
+      return false;
+    }
+
+    console.warn("Playback could not continue after the source switch", error);
+    runtime.playback.pendingResume = false;
+    runtime.playback.desiredPlaying = false;
+    showPlaybackGestureFallback(`${moodLabel} is ready. Tap Start to continue.`);
+    syncPlayerState();
+    return false;
+  }
 }
 
 function updateLayerCards() {
@@ -840,10 +925,13 @@ function updateRoomUi() {
   }
 
   const activeAudio = getActiveAudio();
-  const playing = Boolean(activeAudio && !activeAudio.paused && !activeAudio.ended);
+  const playing = isAudioPlaying(activeAudio);
+  const needsGesture = runtime.playback.autoplayBlocked && !playing;
   elements.roomPlayButton.classList.toggle("is-playing", playing);
-  elements.roomPlayButton.textContent = playing ? "pause" : "start";
+  elements.roomPlayButton.classList.toggle("needs-gesture", needsGesture);
+  elements.roomPlayButton.textContent = playing ? "pause" : needsGesture ? "play" : "start";
   elements.roomPlayButton.setAttribute("aria-label", playing ? "Pause room" : "Start room");
+  elements.roomPlayButton.title = playing ? "Pause room" : needsGesture ? "Tap to play" : "Play room";
   elements.roomPlayButton.disabled = !activeAudio;
 
   elements.roomClock.textContent = formatRoomClock();
@@ -998,6 +1086,7 @@ async function loadDemo(options = {}) {
     };
     runtime.currentWaveformPeaks = engine.createWaveformPeaks(monitorBuffer, 120);
     elements.originalPreview.loop = true;
+    elements.originalPreview.preload = auto ? "auto" : "metadata";
     elements.originalPreview.src = runtime.sourceUrl;
     elements.originalPreview.load();
     await refreshVirtualSourceMonitor();
@@ -1017,7 +1106,7 @@ async function loadDemo(options = {}) {
   }
 
   if (hasSourceTrack()) {
-    await renderPreview({ autoplay: false });
+    await renderPreview({ autoplay: auto, autoplayAttempt: auto });
   }
 }
 
@@ -1144,12 +1233,12 @@ async function renderPreview(options = {}) {
     return;
   }
 
-  const { autoplay = false } = options;
+  const { autoplay = false, autoplayAttempt = false } = options;
 
   if (runtime.wholePreviewReady && getWholePreviewAudioElement().src) {
     runtime.livePreview.session = buildSession();
     if (autoplay) {
-      await playAudio(getWholePreviewAudioElement());
+      await playAudio(getWholePreviewAudioElement(), { autoplayAttempt });
     } else {
       syncPlayerState();
     }
@@ -1199,7 +1288,7 @@ async function renderPreview(options = {}) {
     }
 
     if (autoplay) {
-      await playAudio(getWholePreviewAudioElement());
+      await playAudio(getWholePreviewAudioElement(), { autoplayAttempt });
     } else {
       syncPlayerState();
     }
@@ -1368,6 +1457,10 @@ async function prepareLivePreviewGraph(session) {
   const context = getLiveAudioContext();
   const audio = getWholePreviewAudioElement();
 
+  if (context.state === "suspended") {
+    await context.resume();
+  }
+
   cleanupLivePreviewGraph();
 
   if (!runtime.livePreview.mediaSource || runtime.livePreview.audio !== audio) {
@@ -1471,10 +1564,6 @@ async function prepareLivePreviewGraph(session) {
   runtime.livePreview.signature = liveSessionSignature(session);
   updateLivePreviewMix(session, { smooth: false });
 
-  if (context.state === "suspended") {
-    await context.resume();
-  }
-
   syncLivePreviewPlayback();
 }
 
@@ -1520,9 +1609,10 @@ function cleanupLivePreviewGraph() {
 }
 
 function getLiveAudioContext() {
-  if (!runtime.livePreview.context) {
+  if (!runtime.livePreview.context || runtime.livePreview.context.state === "closed") {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     runtime.livePreview.context = new AudioContextClass();
+    runtime.livePreview.bufferCache.clear();
   }
 
   return runtime.livePreview.context;
@@ -1587,18 +1677,36 @@ function needsLivePreviewRebuild(session) {
 function smoothRebuildLivePreviewGraph(session) {
   const { context, layerBus } = runtime.livePreview;
   const audio = getWholePreviewAudioElement();
-  const wasPlaying = audio && !audio.paused;
+  const shouldContinuePlaying =
+    runtime.playback.desiredPlaying ||
+    isAudioPlaying(audio) ||
+    runtime.playback.pendingResume;
+  const rebuildToken = ++runtime.livePreview.rebuildToken;
 
   if (context && layerBus) {
     layerBus.gain.cancelScheduledValues(context.currentTime);
     layerBus.gain.setTargetAtTime(0, context.currentTime, 0.08);
   }
 
-  window.setTimeout(() => {
+  window.clearTimeout(runtime.livePreview.rebuildTimerId);
+  runtime.livePreview.rebuildTimerId = window.setTimeout(() => {
+    if (rebuildToken !== runtime.livePreview.rebuildToken) {
+      return;
+    }
+
     prepareLivePreviewGraph(session)
       .then(() => {
+        if (rebuildToken !== runtime.livePreview.rebuildToken) {
+          return undefined;
+        }
+
         updateLivePreviewMix(session, { smooth: true });
-        if (wasPlaying) {
+        ensureRoomSceneRunning({ redraw: true });
+        if (
+          shouldContinuePlaying &&
+          runtime.playback.desiredPlaying &&
+          audio.paused
+        ) {
           return audio.play();
         }
         return undefined;
@@ -1626,7 +1734,19 @@ function rampAudioParam(param, value, context, timeConstant) {
 
 function addLiveTextureLayer(context, kind, destination) {
   const source = context.createBufferSource();
-  source.buffer = createLiveNoiseBuffer(context, kind, kind === "dust" ? 7 : 11);
+  const mobileProfile = usesMobileRenderingProfile();
+  const seconds = mobileProfile
+    ? kind === "dust"
+      ? 3
+      : 4
+    : kind === "dust"
+      ? 7
+      : 11;
+  const bufferKey = `noise:${context.sampleRate}:${kind}:${seconds}`;
+  source.buffer = getCachedLiveBuffer(
+    bufferKey,
+    () => createLiveNoiseBuffer(context, kind, seconds),
+  );
   source.loop = true;
 
   const filter = context.createBiquadFilter();
@@ -1648,7 +1768,13 @@ function addLiveTextureLayer(context, kind, destination) {
 
 function addLiveDrumLayer(context, session, destination) {
   const source = context.createBufferSource();
-  source.buffer = createLiveDrumLoopBuffer(context, session);
+  const compactLoop = usesMobileRenderingProfile();
+  const bufferKey =
+    `drums:${context.sampleRate}:${liveSessionSignature(session)}:${compactLoop ? "compact" : "full"}`;
+  source.buffer = getCachedLiveBuffer(
+    bufferKey,
+    () => createLiveDrumLoopBuffer(context, session, compactLoop),
+  );
   source.loop = true;
 
   const gain = context.createGain();
@@ -1660,6 +1786,14 @@ function addLiveDrumLayer(context, session, destination) {
   runtime.livePreview.sources.push(source);
   runtime.livePreview.nodes.push(gain);
   return gain;
+}
+
+function getCachedLiveBuffer(key, createBuffer) {
+  if (!runtime.livePreview.bufferCache.has(key)) {
+    runtime.livePreview.bufferCache.set(key, createBuffer());
+  }
+
+  return runtime.livePreview.bufferCache.get(key);
 }
 
 function createLiveNoiseBuffer(context, kind, seconds) {
@@ -1680,10 +1814,10 @@ function createLiveNoiseBuffer(context, kind, seconds) {
   return buffer;
 }
 
-function createLiveDrumLoopBuffer(context, session) {
+function createLiveDrumLoopBuffer(context, session, compactLoop = false) {
   const bpm = clamp(session.beat.tempo, 60, 150);
   const beatDuration = 60 / bpm;
-  const bars = session.beat.style === "house" ? 2 : 4;
+  const bars = session.beat.style === "house" || compactLoop ? 2 : 4;
   const duration = beatDuration * 4 * bars;
   const length = Math.max(1, Math.floor(duration * context.sampleRate));
   const buffer = context.createBuffer(1, length, context.sampleRate);
@@ -1847,6 +1981,7 @@ function toggleLayer(layerId) {
   updateActiveChips();
   updateSummary();
   persistState();
+  ensureRoomSceneRunning({ redraw: true });
   schedulePreview("Layer toggled. Fading the feature smoothly...");
 }
 
@@ -1860,6 +1995,10 @@ function getActiveAudio() {
   }
 
   return null;
+}
+
+function isAudioPlaying(audio) {
+  return Boolean(audio && !audio.paused && !audio.ended && audio.currentSrc);
 }
 
 function hasSourceTrack() {
@@ -1896,48 +2035,67 @@ async function togglePlayer() {
   if (activeAudio.paused) {
     await playAudio(activeAudio);
   } else {
+    runtime.playback.desiredPlaying = false;
+    runtime.playback.pendingResume = false;
+    runtime.playback.sourceSwitchId += 1;
     activeAudio.pause();
   }
 }
 
-async function playAudio(audio) {
+async function playAudio(audio, options = {}) {
+  const { autoplayAttempt = false } = options;
+  runtime.playback.desiredPlaying = true;
+  runtime.playback.pendingResume = false;
+  ensureRoomSceneRunning({ redraw: true });
+
   try {
     const otherAudio = audio === elements.originalPreview ? elements.processedPreview : elements.originalPreview;
     otherAudio.pause();
 
     const shouldUseLiveLayers = audio === getWholePreviewAudioElement() && runtime.wholePreviewReady;
     const session = shouldUseLiveLayers ? runtime.livePreview.session || buildSession() : null;
-    const shouldPrimePlayback =
-      shouldUseLiveLayers &&
-      (!runtime.livePreview.controls || needsLivePreviewRebuild(session));
-    let playbackStarted = false;
-
-    if (shouldPrimePlayback) {
-      await audio.play();
-      playbackStarted = true;
-      syncPlayerState();
-      tickWaveforms();
-    }
+    await audio.play();
+    syncPlayerState();
+    tickWaveforms();
 
     if (shouldUseLiveLayers) {
-      if (runtime.livePreview.controls && runtime.livePreview.signature === liveSessionSignature(session)) {
-        updateLivePreviewMix(session, { smooth: true });
-      } else {
-        await prepareLivePreviewGraph(session);
+      try {
+        if (runtime.livePreview.controls && runtime.livePreview.signature === liveSessionSignature(session)) {
+          if (runtime.livePreview.context?.state === "suspended") {
+            await runtime.livePreview.context.resume();
+          }
+          updateLivePreviewMix(session, { smooth: true });
+        } else {
+          await prepareLivePreviewGraph(session);
+        }
+      } catch (error) {
+        console.warn("Live ambience could not start; base playback is continuing", error);
       }
     }
 
-    if (!playbackStarted) {
-      await audio.play();
-    }
-
+    runtime.playback.autoplayBlocked = false;
     updateStatus("Room is playing.", "success");
     syncPlayerState();
+    ensureRoomSceneRunning({ redraw: true });
+    return true;
   } catch (error) {
     console.warn("Playback failed", error);
-    updateStatus("Playback was blocked by the browser. Press Start again after the room finishes loading.", "error");
+    runtime.playback.desiredPlaying = false;
+    runtime.playback.pendingResume = false;
+    showPlaybackGestureFallback(
+      autoplayAttempt
+        ? "Autoplay is blocked in this browser. Tap Start once to begin."
+        : "Playback could not start. Tap Start to try again.",
+    );
     syncPlayerState();
+    return false;
   }
+}
+
+function showPlaybackGestureFallback(message) {
+  runtime.playback.autoplayBlocked = true;
+  updateStatus(message, "neutral");
+  ensureRoomSceneRunning({ redraw: true });
 }
 
 function syncPlayerState() {
@@ -1968,16 +2126,32 @@ function syncPlayerState() {
 
 function tickWaveforms() {
   cancelAnimationFrame(runtime.rafId);
-  const animate = () => {
-    drawWaveforms();
+  runtime.rafId = 0;
+  runtime.lastPlayerFrameTimestamp = 0;
+
+  const animate = (timestamp) => {
+    runtime.rafId = 0;
     const activeAudio = getActiveAudio();
-    if (activeAudio && !activeAudio.paused) {
-      syncPlayerState();
+
+    if (isAudioPlaying(activeAudio)) {
       runtime.rafId = requestAnimationFrame(animate);
+    }
+
+    const frameInterval = usesMobileRenderingProfile() ? 140 : 70;
+    if (
+      runtime.lastPlayerFrameTimestamp &&
+      timestamp - runtime.lastPlayerFrameTimestamp < frameInterval
+    ) {
       return;
     }
 
-    runtime.rafId = 0;
+    runtime.lastPlayerFrameTimestamp = timestamp;
+    try {
+      drawWaveforms();
+      syncPlayerState();
+    } catch (error) {
+      console.warn("Player meter frame failed", error);
+    }
   };
 
   runtime.rafId = requestAnimationFrame(animate);
@@ -2079,6 +2253,28 @@ function formatRoomClock() {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
+function usesMobileRenderingProfile() {
+  const coarsePointer =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  const compactViewport = window.innerWidth <= 720;
+  const hardwareConcurrency = Number(navigator.hardwareConcurrency) || 0;
+  const constrainedCpu = hardwareConcurrency > 0 && hardwareConcurrency <= 4;
+  return coarsePointer || compactViewport || constrainedCpu;
+}
+
+function getRoomFrameInterval() {
+  const reduceMotion =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const fps = reduceMotion
+    ? 15
+    : usesMobileRenderingProfile()
+      ? MOBILE_ROOM_FPS
+      : DESKTOP_ROOM_FPS;
+  return 1000 / fps;
+}
+
 function startRoomScene() {
   const canvas = elements.roomCanvas;
   if (!canvas) {
@@ -2086,15 +2282,195 @@ function startRoomScene() {
   }
 
   const context = canvas.getContext("2d");
+  if (!context) {
+    console.warn("The room canvas could not be initialized.");
+    return;
+  }
+
+  runtime.roomScene.context = context;
   context.imageSmoothingEnabled = false;
 
-  const draw = (timestamp) => {
-    runtime.roomScene.lastTimestamp = timestamp;
-    drawRoomScene(context, timestamp / 1000);
-    runtime.roomScene.rafId = requestAnimationFrame(draw);
-  };
+  if (!runtime.roomScene.listenersBound) {
+    runtime.roomScene.listenersBound = true;
 
-  runtime.roomScene.rafId = requestAnimationFrame(draw);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        cancelAnimationFrame(runtime.roomScene.rafId);
+        runtime.roomScene.rafId = 0;
+        return;
+      }
+
+      restartRoomScene();
+      void resumePlaybackAfterPageReturn();
+    });
+
+    window.addEventListener("pageshow", () => {
+      restartRoomScene();
+      void resumePlaybackAfterPageReturn();
+    });
+
+    window.addEventListener("resize", () => {
+      ensureRoomSceneRunning({ redraw: true });
+    });
+
+    window.addEventListener("orientationchange", () => {
+      restartRoomScene();
+    });
+
+    canvas.addEventListener("contextlost", (event) => {
+      event.preventDefault();
+      cancelAnimationFrame(runtime.roomScene.rafId);
+      runtime.roomScene.rafId = 0;
+      runtime.roomScene.context = null;
+    });
+
+    canvas.addEventListener("contextrestored", () => {
+      const restoredContext = canvas.getContext("2d");
+      if (!restoredContext) {
+        return;
+      }
+
+      restoredContext.imageSmoothingEnabled = false;
+      runtime.roomScene.context = restoredContext;
+      restartRoomScene();
+    });
+
+    runtime.roomScene.watchdogId = window.setInterval(() => {
+      if (document.hidden || !runtime.roomScene.context) {
+        return;
+      }
+
+      const now = performance.now();
+      const frameIsStale =
+        !runtime.roomScene.rafId ||
+        !runtime.roomScene.lastTimestamp ||
+        now - runtime.roomScene.lastTimestamp > ROOM_SCENE_STALE_MS;
+      if (frameIsStale) {
+        restartRoomScene();
+      }
+    }, 1200);
+  }
+
+  restartRoomScene();
+}
+
+function stopRoomScene() {
+  runtime.roomScene.generation += 1;
+  cancelAnimationFrame(runtime.roomScene.rafId);
+  runtime.roomScene.rafId = 0;
+  window.clearInterval(runtime.roomScene.watchdogId);
+  runtime.roomScene.watchdogId = 0;
+}
+
+function restartRoomScene() {
+  if (!runtime.roomScene.context || document.hidden) {
+    return;
+  }
+
+  runtime.roomScene.generation += 1;
+  cancelAnimationFrame(runtime.roomScene.rafId);
+  runtime.roomScene.rafId = 0;
+  runtime.roomScene.lastDrawTimestamp = 0;
+  drawRoomSceneSafely(performance.now());
+  queueRoomSceneFrame();
+}
+
+function ensureRoomSceneRunning(options = {}) {
+  const { redraw = false, restart = false } = options;
+
+  if (!runtime.roomScene.context) {
+    startRoomScene();
+    return;
+  }
+
+  if (restart) {
+    restartRoomScene();
+    return;
+  }
+
+  if (redraw && !document.hidden) {
+    drawRoomSceneSafely(performance.now());
+  }
+
+  if (!runtime.roomScene.rafId && !document.hidden) {
+    queueRoomSceneFrame();
+  }
+}
+
+function queueRoomSceneFrame() {
+  if (
+    runtime.roomScene.rafId ||
+    !runtime.roomScene.context ||
+    document.hidden
+  ) {
+    return;
+  }
+
+  const generation = runtime.roomScene.generation;
+  runtime.roomScene.rafId = requestAnimationFrame((timestamp) => {
+    if (generation !== runtime.roomScene.generation) {
+      return;
+    }
+
+    runtime.roomScene.rafId = 0;
+    queueRoomSceneFrame();
+
+    if (
+      runtime.roomScene.lastDrawTimestamp &&
+      timestamp - runtime.roomScene.lastDrawTimestamp < getRoomFrameInterval()
+    ) {
+      return;
+    }
+
+    drawRoomSceneSafely(timestamp);
+  });
+}
+
+function drawRoomSceneSafely(timestamp) {
+  const context = runtime.roomScene.context;
+  if (!context) {
+    return;
+  }
+
+  runtime.roomScene.lastTimestamp = timestamp;
+  runtime.roomScene.lastDrawTimestamp = timestamp;
+
+  try {
+    drawRoomScene(context, timestamp / 1000);
+  } catch (error) {
+    if (timestamp - runtime.roomScene.lastErrorLogTimestamp > 2000) {
+      runtime.roomScene.lastErrorLogTimestamp = timestamp;
+      console.warn("Room animation frame failed and will be retried", error);
+    }
+  }
+}
+
+async function resumePlaybackAfterPageReturn() {
+  if (!runtime.playback.desiredPlaying) {
+    return;
+  }
+
+  const audio = getActiveAudio();
+  if (!audio) {
+    return;
+  }
+
+  try {
+    if (runtime.livePreview.context?.state === "suspended") {
+      await runtime.livePreview.context.resume();
+    }
+    if (audio.paused) {
+      await audio.play();
+    }
+    runtime.playback.autoplayBlocked = false;
+    syncPlayerState();
+    tickWaveforms();
+  } catch (error) {
+    console.warn("Playback did not resume after the page returned", error);
+    runtime.playback.desiredPlaying = false;
+    showPlaybackGestureFallback("Tap Start to resume this room.");
+    syncPlayerState();
+  }
 }
 
 function drawRoomScene(context, time) {

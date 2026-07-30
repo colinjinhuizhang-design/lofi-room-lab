@@ -2171,6 +2171,16 @@ body {
   text-transform: uppercase;
 }
 
+.room-scene .room-start.needs-gesture {
+  border-color: #fff4a8;
+  background: linear-gradient(180deg, #fff4a8, #ffb45f);
+  color: #171327;
+  box-shadow:
+    0 0 0 3px rgba(98, 217, 255, 0.42),
+    0 10px 24px rgba(0, 0, 0, 0.34),
+    inset 0 -4px 0 rgba(84, 45, 11, 0.22);
+}
+
 .room-scene .room-clock {
   top: auto;
   right: 14px;
