@@ -263,12 +263,14 @@ const runtime = {
   backgroundMix: {
     active: false,
     audioUrl: "",
+    pendingStatusMessage: "",
     preparing: false,
     queuedReportStatus: false,
     queuedStatusMessage: "",
     rerenderQueued: false,
     renderTimerId: 0,
     renderToken: 0,
+    session: null,
     signature: "",
     sourceBuffer: null,
     sourceKey: "",
@@ -650,35 +652,7 @@ function configureBackgroundPlayback() {
     });
   }
 
-  document.addEventListener("visibilitychange", () => {
-    if (
-      document.hidden &&
-      runtime.playback.nativeMediaPlayback &&
-      runtime.livePreview.context?.state === "running"
-    ) {
-      runtime.livePreview.context.suspend().catch(() => {});
-      return;
-    }
-
-    if (
-      !document.hidden &&
-      runtime.playback.nativeMediaPlayback &&
-      runtime.playback.desiredPlaying &&
-      getActiveAudio() === getWholePreviewAudioElement() &&
-      runtime.livePreview.context?.state === "suspended"
-    ) {
-      runtime.livePreview.context
-        .resume()
-        .then(() => {
-          updateLivePreviewMix(
-            runtime.livePreview.session || buildSession(),
-            { smooth: false },
-          );
-          syncLivePreviewPlayback();
-        })
-        .catch(() => {});
-    }
-  });
+  document.addEventListener("visibilitychange", handlePlaybackVisibilityChange);
 
   if (!("mediaSession" in navigator)) {
     return;
@@ -1459,9 +1433,18 @@ function renderSourceMeta(name, duration, size, sizeLabel = "") {
 async function loadMoodAudioAsset() {
   const mood = currentMood();
   const asset = TRACK_ASSETS[runtime.state.mood] ?? TRACK_ASSETS.focus;
+  const response = await fetch(asset.url, { cache: "force-cache" });
+  if (!response.ok) {
+    throw new Error(`Could not load ${asset.name} (${response.status}).`);
+  }
+
+  const audioBlob = await response.blob();
   return {
     ...asset,
     displayName: mood.label,
+    size: audioBlob.size,
+    type: audioBlob.type || asset.type,
+    url: URL.createObjectURL(audioBlob),
   };
 }
 
@@ -1530,7 +1513,7 @@ function updateStatus(message, tone = "neutral") {
   }
 }
 
-function schedulePreview(message) {
+function schedulePreview(message, options = {}) {
   window.clearTimeout(runtime.previewDebounceId);
   if (!hasSourceTrack()) {
     return;
@@ -1551,7 +1534,9 @@ function schedulePreview(message) {
     runtime.livePreview.session = session;
     if (runtime.playback.nativeMediaPlayback) {
       handoffNativeMixToLiveControls(session);
-      scheduleBackgroundMixRender(message);
+      scheduleBackgroundMixRender(message, {
+        immediate: Boolean(options.immediateBackgroundMix),
+      });
       updateSummary();
       syncPlayerState();
       return;
@@ -1628,6 +1613,7 @@ function handoffNativeMixToLiveControls(session) {
   }
 
   document.documentElement.dataset.mobileMixRoute = "live-effects";
+  syncMobileEffectDiagnostics(session, "live-effects", "starting");
   if (playbackPosition !== null) {
     document.documentElement.dataset.mobileLiveHandoffPosition =
       playbackPosition.toFixed(3);
@@ -1642,7 +1628,7 @@ function handoffNativeMixToLiveControls(session) {
     return;
   }
 
-  if (runtime.livePreview.context?.state === "suspended") {
+  if (canResumeLiveAudioContext()) {
     runtime.livePreview.context
       .resume()
       .then(() => {
@@ -1938,7 +1924,9 @@ function cleanupBackgroundMix(options = {}) {
   background.rerenderQueued = false;
   background.queuedReportStatus = false;
   background.queuedStatusMessage = "";
+  background.pendingStatusMessage = "";
   background.active = false;
+  background.session = null;
   background.signature = "";
   background.sourceStart = 0;
 
@@ -1961,7 +1949,7 @@ function cleanupBackgroundMix(options = {}) {
     runtime.playback.nativeMediaPlayback ? "pending" : "not-required";
 }
 
-function scheduleBackgroundMixRender(message = "") {
+function scheduleBackgroundMixRender(message = "", options = {}) {
   if (!runtime.playback.nativeMediaPlayback || !hasSourceTrack()) {
     return;
   }
@@ -1969,23 +1957,69 @@ function scheduleBackgroundMixRender(message = "") {
   const background = runtime.backgroundMix;
   window.clearTimeout(background.renderTimerId);
   const renderToken = ++background.renderToken;
+  background.pendingStatusMessage = message;
   document.documentElement.dataset.lockScreenMix = "pending";
 
-  background.renderTimerId = window.setTimeout(() => {
+  const startRender = () => {
     background.renderTimerId = 0;
-    if (background.preparing) {
-      background.rerenderQueued = true;
-      background.queuedReportStatus = true;
-      background.queuedStatusMessage = message;
-      return;
-    }
+    startBackgroundMixRender(renderToken, message, true);
+  };
 
-    void prepareBackgroundMix({
-      renderToken,
-      reportStatus: true,
-      statusMessage: message,
-    });
-  }, 420);
+  if (options.immediate || document.hidden) {
+    startRender();
+    return;
+  }
+
+  background.renderTimerId = window.setTimeout(startRender, 420);
+}
+
+function startBackgroundMixRender(renderToken, message, reportStatus) {
+  const background = runtime.backgroundMix;
+  if (background.preparing) {
+    background.rerenderQueued = true;
+    background.queuedReportStatus =
+      background.queuedReportStatus || reportStatus;
+    if (message) {
+      background.queuedStatusMessage = message;
+    }
+    return;
+  }
+
+  background.pendingStatusMessage = "";
+  void prepareBackgroundMix({
+    renderToken,
+    reportStatus,
+    statusMessage: message,
+  });
+}
+
+function flushPendingBackgroundMixRender() {
+  if (!runtime.playback.nativeMediaPlayback || !hasSourceTrack()) {
+    return false;
+  }
+
+  const background = runtime.backgroundMix;
+  if (background.preparing && !background.renderTimerId) {
+    return true;
+  }
+
+  if (
+    background.active &&
+    !background.renderTimerId &&
+    !background.preparing
+  ) {
+    return false;
+  }
+
+  window.clearTimeout(background.renderTimerId);
+  background.renderTimerId = 0;
+  const renderToken = background.renderToken || ++background.renderToken;
+  startBackgroundMixRender(
+    renderToken,
+    background.pendingStatusMessage,
+    false,
+  );
+  return true;
 }
 
 async function prepareBackgroundMix(options = {}) {
@@ -2094,6 +2128,7 @@ async function prepareBackgroundMix(options = {}) {
     const audioUrl = URL.createObjectURL(engine.encodePreview(rendered));
     const installed = await installBackgroundMix(audioUrl, {
       renderToken,
+      session,
       signature,
       sourceStart: 0,
     });
@@ -2170,6 +2205,7 @@ async function installBackgroundMix(audioUrl, options) {
   const audio = elements.backgroundPreview;
   const previousUrl = background.audioUrl;
   const previousSignature = background.signature;
+  const previousSession = background.session;
   const previousSourceStart = background.sourceStart;
   const previousActive = background.active;
   const previousPosition = Number(audio.currentTime) || 0;
@@ -2191,6 +2227,7 @@ async function installBackgroundMix(audioUrl, options) {
 
   background.active = true;
   background.audioUrl = audioUrl;
+  background.session = options.session;
   background.signature = options.signature;
   background.sourceStart = options.sourceStart;
   document.documentElement.dataset.lockScreenMix = "ready";
@@ -2225,6 +2262,7 @@ async function installBackgroundMix(audioUrl, options) {
       console.warn("The prepared lock-screen mix could not take over playback", error);
       background.active = previousActive;
       background.audioUrl = previousUrl;
+      background.session = previousSession;
       background.signature = previousSignature;
       background.sourceStart = previousSourceStart;
 
@@ -2262,6 +2300,11 @@ async function installBackgroundMix(audioUrl, options) {
       URL.revokeObjectURL(audioUrl);
       document.documentElement.dataset.lockScreenMix =
         previousActive ? "ready" : "fallback";
+      syncMobileEffectDiagnostics(
+        previousSession || buildSession(),
+        previousActive ? "native-effects" : "live-effects",
+        previousActive ? "ready" : "fallback",
+      );
       return false;
     }
 
@@ -2275,7 +2318,7 @@ async function installBackgroundMix(audioUrl, options) {
 
   runtime.mediaSession.lastPositionUpdate = 0;
   runtime.playback.pendingHandoffPosition = null;
-  document.documentElement.dataset.mobileMixRoute = "native-effects";
+  syncMobileEffectDiagnostics(options.session, "native-effects", "ready");
   return true;
 }
 
@@ -2287,6 +2330,7 @@ async function discardStaleBackgroundInstall(audioUrl, previous) {
   audio.load();
   background.active = false;
   background.audioUrl = "";
+  background.session = null;
   background.signature = "";
   background.sourceStart = 0;
 
@@ -2372,7 +2416,7 @@ async function prepareLivePreviewGraph(session) {
   const audio = getWholePreviewAudioElement();
   const nativeMediaPlayback = runtime.playback.nativeMediaPlayback;
 
-  if (context.state === "suspended") {
+  if (canResumeLiveAudioContext(context)) {
     await context.resume();
   }
 
@@ -2428,7 +2472,7 @@ async function prepareLivePreviewGraph(session) {
   layerBus.gain.value = 0;
 
   const master = context.createGain();
-  master.gain.value = 1.08;
+  master.gain.value = getLiveEffectMasterLevel(session);
 
   const outputLimiter = context.createDynamicsCompressor();
   outputLimiter.threshold.value = -9;
@@ -2478,6 +2522,7 @@ async function prepareLivePreviewGraph(session) {
       rain: addLiveTextureLayer(context, "rain", layerBus),
     },
     lowpass,
+    master,
     sourceGain,
     wetGain,
   };
@@ -2531,11 +2576,24 @@ function cleanupLivePreviewGraph() {
 function getLiveAudioContext() {
   if (!runtime.livePreview.context || runtime.livePreview.context.state === "closed") {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    runtime.livePreview.context = new AudioContextClass();
+    const context = new AudioContextClass();
+    runtime.livePreview.context = context;
+    context.addEventListener("statechange", () => {
+      document.documentElement.dataset.liveEffectContext =
+        context.state || "closed";
+    });
+    document.documentElement.dataset.liveEffectContext =
+      context.state;
     runtime.livePreview.bufferCache.clear();
   }
 
   return runtime.livePreview.context;
+}
+
+function canResumeLiveAudioContext(context = runtime.livePreview.context) {
+  return Boolean(
+    context && context.state !== "running" && context.state !== "closed",
+  );
 }
 
 function syncLivePreviewPlayback() {
@@ -2580,10 +2638,39 @@ function updateLivePreviewMix(session, options = {}) {
   );
   rampAudioParam(controls.feedback.gain, scalePercent(session.fx.reverb, 0.02, 0.16), context, timeConstant);
   rampAudioParam(controls.wetGain.gain, scalePercent(session.fx.reverb, 0.015, 0.11), context, timeConstant);
+  rampAudioParam(controls.master.gain, getLiveEffectMasterLevel(session), context, timeConstant);
   rampAudioParam(controls.layerGains.dust.gain, dustLevel, context, timeConstant);
   rampAudioParam(controls.layerGains.rain.gain, rainLevel, context, timeConstant);
   rampAudioParam(controls.layerGains.cafe.gain, cafeLevel, context, timeConstant);
   rampAudioParam(controls.layerGains.drums.gain, drumLevel, context, timeConstant);
+  if (runtime.playback.nativeMediaPlayback && !runtime.backgroundMix.active) {
+    syncMobileEffectDiagnostics(session, "live-effects", "ready");
+  }
+}
+
+function getLiveEffectMasterLevel(session) {
+  return runtime.playback.nativeMediaPlayback
+    ? scalePercent(session.mixer.master, 0, 1.08)
+    : 1.08;
+}
+
+function syncMobileEffectDiagnostics(session, route, state) {
+  if (!runtime.playback.nativeMediaPlayback || !session) {
+    return;
+  }
+
+  const root = document.documentElement;
+  root.dataset.mobileMixRoute = route;
+  root.dataset.mobileEffectState = state;
+  root.dataset.mobileEffectRain = String(Math.round(session.ambience.rain));
+  root.dataset.mobileEffectCafe = String(Math.round(session.ambience.cafe));
+  root.dataset.mobileEffectDust = String(Math.round(session.ambience.noise));
+  root.dataset.mobileEffectDrums = String(Math.round(session.mixer.drums));
+  root.dataset.mobileEffectMaster = String(Math.round(session.mixer.master));
+  root.dataset.liveEffectContext =
+    runtime.livePreview.context?.state || "not-created";
+  root.dataset.backgroundEffectContinuity =
+    route === "native-effects" ? "native-effects" : "live-until-native";
 }
 
 function needsLivePreviewRebuild(session) {
@@ -2874,15 +2961,16 @@ function seekAudioElement(audio, targetTime) {
   const boundedTime = Math.min(Math.max(0, targetTime), Math.max(0, audio.duration - 0.1));
 
   try {
-    if (typeof audio.fastSeek === "function") {
-      audio.fastSeek(boundedTime);
-    }
+    audio.currentTime = boundedTime;
+    return;
   } catch {
-    // Some browsers expose fastSeek but reject it for blob or file-backed media.
+    // Fall through to fastSeek for media implementations that reject assignment.
   }
 
   try {
-    audio.currentTime = boundedTime;
+    if (typeof audio.fastSeek === "function") {
+      audio.fastSeek(boundedTime);
+    }
   } catch {
     // Keep playback usable even when a browser cannot seek this media source yet.
   }
@@ -2909,7 +2997,9 @@ function toggleLayer(layerId) {
   updateSummary();
   persistState();
   ensureRoomSceneRunning({ redraw: true });
-  schedulePreview("Layer toggled. Fading the feature smoothly...");
+  schedulePreview("Layer toggled. Fading the feature smoothly...", {
+    immediateBackgroundMix: true,
+  });
 }
 
 function getActiveAudio() {
@@ -3002,7 +3092,7 @@ async function playAudio(audio, options = {}) {
       const session = runtime.livePreview.session || buildSession();
       try {
         if (runtime.livePreview.controls && runtime.livePreview.signature === liveSessionSignature(session)) {
-          if (runtime.livePreview.context?.state === "suspended") {
+          if (canResumeLiveAudioContext()) {
             await runtime.livePreview.context.resume();
           }
           updateLivePreviewMix(session, { smooth: true });
@@ -3263,7 +3353,6 @@ function startRoomScene() {
       }
 
       scheduleRoomScenePresent(0);
-      void resumePlaybackAfterPageReturn();
     });
 
     window.addEventListener("pageshow", () => {
@@ -3613,12 +3702,33 @@ async function resumePlaybackAfterPageReturn() {
     return;
   }
 
+  const shouldUseLiveEffects =
+    audio === getWholePreviewAudioElement() &&
+    runtime.wholePreviewReady &&
+    (!runtime.playback.nativeMediaPlayback || !runtime.backgroundMix.active);
+
   try {
-    if (runtime.livePreview.context?.state === "suspended") {
+    if (
+      shouldUseLiveEffects &&
+      canResumeLiveAudioContext()
+    ) {
       await runtime.livePreview.context.resume();
     }
     if (audio.paused) {
       await audio.play();
+    }
+    if (shouldUseLiveEffects) {
+      const session = buildSession();
+      runtime.livePreview.session = session;
+      if (
+        runtime.livePreview.controls &&
+        !needsLivePreviewRebuild(session)
+      ) {
+        updateLivePreviewMix(session, { smooth: false });
+        syncLivePreviewPlayback();
+      } else {
+        await prepareLivePreviewGraph(session);
+      }
     }
     runtime.playback.autoplayBlocked = false;
     syncPlayerState();
@@ -3628,6 +3738,32 @@ async function resumePlaybackAfterPageReturn() {
     runtime.playback.desiredPlaying = false;
     showPlaybackGestureFallback("Tap Start to resume this room.");
     syncPlayerState();
+  }
+}
+
+function handlePlaybackVisibilityChange() {
+  if (!runtime.playback.nativeMediaPlayback) {
+    return;
+  }
+
+  if (!document.hidden) {
+    void resumePlaybackAfterPageReturn();
+    return;
+  }
+
+  const usingLiveEffects =
+    runtime.playback.desiredPlaying &&
+    getActiveAudio() === getWholePreviewAudioElement() &&
+    runtime.wholePreviewReady &&
+    !runtime.backgroundMix.active;
+
+  document.documentElement.dataset.backgroundEffectContinuity =
+    usingLiveEffects ? "live-until-native" : "native-effects";
+
+  if (usingLiveEffects) {
+    // Do not suspend the effect graph here. Mobile browsers decide when Web Audio
+    // must pause; meanwhile, start the lock-screen-safe native mix immediately.
+    flushPendingBackgroundMixRender();
   }
 }
 
