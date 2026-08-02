@@ -177,6 +177,7 @@ const MEDIA_ARTWORK_BY_MOOD = {
 };
 
 const engine = new window.AudioStudioEngine();
+const MIX_PROFILE = window.AudioStudioMixProfile;
 
 const elements = {
   activeSoundChips: document.getElementById("activeSoundChips"),
@@ -287,6 +288,9 @@ const runtime = {
     signature: "",
     session: null,
     bufferCache: new Map(),
+    graphToken: 0,
+    preparePromise: null,
+    preparingSignature: "",
     rebuildTimerId: 0,
     rebuildToken: 0,
   },
@@ -1623,41 +1627,15 @@ function handoffNativeMixToLiveControls(session) {
     return;
   }
 
+  const liveGraphPromise = ensureLivePreviewGraph(session, { smooth: false });
   if (backgroundWasActive || originalAudio.paused) {
-    void playAudio(originalAudio);
+    void playAudio(originalAudio, { liveGraphPromise });
     return;
   }
 
-  if (canResumeLiveAudioContext()) {
-    runtime.livePreview.context
-      .resume()
-      .then(() => {
-        const currentSession = runtime.livePreview.session || session;
-        if (needsLivePreviewRebuild(currentSession)) {
-          smoothRebuildLivePreviewGraph(currentSession);
-        } else {
-          updateLivePreviewMix(currentSession, { smooth: true });
-          syncLivePreviewPlayback();
-        }
-      })
-      .catch((error) => {
-        console.warn("Live mobile effects could not resume", error);
-      });
-    return;
-  }
-
-  if (!runtime.livePreview.controls) {
-    void prepareLivePreviewGraph(session).catch((error) => {
-      console.warn("Live mobile effects could not start", error);
-    });
-    return;
-  }
-
-  if (needsLivePreviewRebuild(session)) {
-    smoothRebuildLivePreviewGraph(session);
-  } else {
-    updateLivePreviewMix(session, { smooth: true });
-  }
+  void liveGraphPromise.catch((error) => {
+    console.warn("Live mobile effects could not start", error);
+  });
 }
 
 async function renderPreview(options = {}) {
@@ -2412,15 +2390,24 @@ function createBackgroundMixSignature(sourceKey, session, duration) {
 }
 
 async function prepareLivePreviewGraph(session) {
+  const live = runtime.livePreview;
+  const graphToken = ++live.graphToken;
   const context = getLiveAudioContext();
   const audio = getWholePreviewAudioElement();
   const nativeMediaPlayback = runtime.playback.nativeMediaPlayback;
 
   if (canResumeLiveAudioContext(context)) {
-    await context.resume();
+    void resumeLiveAudioContext(context);
   }
 
-  cleanupLivePreviewGraph();
+  if (
+    graphToken !== live.graphToken ||
+    (nativeMediaPlayback && runtime.backgroundMix.active)
+  ) {
+    return false;
+  }
+
+  cleanupLivePreviewGraph({ preserveGraphToken: true });
 
   if (
     !nativeMediaPlayback &&
@@ -2433,7 +2420,11 @@ async function prepareLivePreviewGraph(session) {
   runtime.livePreview.session = session;
 
   const sourceGain = context.createGain();
-  sourceGain.gain.value = scalePercent(session.uploadMix, 0, 1.16);
+  sourceGain.gain.value = scalePercent(
+    session.uploadMix,
+    0,
+    MIX_PROFILE.live.source,
+  );
 
   const highpass = context.createBiquadFilter();
   highpass.type = "highpass";
@@ -2530,10 +2521,18 @@ async function prepareLivePreviewGraph(session) {
   updateLivePreviewMix(session, { smooth: false });
 
   syncLivePreviewPlayback();
+  return true;
 }
 
-function cleanupLivePreviewGraph() {
+function cleanupLivePreviewGraph(options = {}) {
+  const { preserveGraphToken = false } = options;
   const live = runtime.livePreview;
+
+  if (!preserveGraphToken) {
+    live.graphToken += 1;
+    live.preparePromise = null;
+    live.preparingSignature = "";
+  }
 
   for (const source of live.sources) {
     try {
@@ -2573,6 +2572,48 @@ function cleanupLivePreviewGraph() {
   live.session = null;
 }
 
+function ensureLivePreviewGraph(session, options = {}) {
+  const { smooth = true } = options;
+  const live = runtime.livePreview;
+  const signature = liveSessionSignature(session);
+  live.session = session;
+
+  if (live.controls && live.signature === signature) {
+    updateLivePreviewMix(session, { smooth });
+    syncLivePreviewPlayback();
+    return Promise.resolve(true);
+  }
+
+  if (live.preparePromise && live.preparingSignature === signature) {
+    return live.preparePromise;
+  }
+
+  const promise = prepareLivePreviewGraph(session)
+    .then((prepared) => {
+      if (
+        prepared &&
+        !runtime.backgroundMix.active &&
+        live.controls
+      ) {
+        const latestSession = buildSession();
+        live.session = latestSession;
+        updateLivePreviewMix(latestSession, { smooth });
+        syncLivePreviewPlayback();
+      }
+      return prepared;
+    })
+    .finally(() => {
+      if (live.preparePromise === promise) {
+        live.preparePromise = null;
+        live.preparingSignature = "";
+      }
+    });
+
+  live.preparePromise = promise;
+  live.preparingSignature = signature;
+  return promise;
+}
+
 function getLiveAudioContext() {
   if (!runtime.livePreview.context || runtime.livePreview.context.state === "closed") {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -2596,6 +2637,20 @@ function canResumeLiveAudioContext(context = runtime.livePreview.context) {
   );
 }
 
+async function resumeLiveAudioContext(context = runtime.livePreview.context) {
+  if (!canResumeLiveAudioContext(context)) {
+    return context?.state === "running";
+  }
+
+  try {
+    await context.resume();
+  } catch {
+    return false;
+  }
+
+  return context.state === "running";
+}
+
 function syncLivePreviewPlayback() {
   const { context, layerBus } = runtime.livePreview;
   if (!context || !layerBus) {
@@ -2609,9 +2664,7 @@ function syncLivePreviewPlayback() {
     !runtime.livePreview.audio.ended &&
     Boolean(runtime.livePreview.audio.src);
   const target = shouldPlay ? 1 : 0;
-
-  layerBus.gain.cancelScheduledValues(context.currentTime);
-  layerBus.gain.setTargetAtTime(target, context.currentTime, 0.025);
+  rampAudioParam(layerBus.gain, target, context, shouldPlay ? 0.06 : 0.09);
 }
 
 function updateLivePreviewMix(session, options = {}) {
@@ -2621,37 +2674,58 @@ function updateLivePreviewMix(session, options = {}) {
   }
 
   const { smooth = true } = options;
-  const timeConstant = smooth ? 0.38 : 0.01;
-  const dustLevel = scalePercent(session.ambience.noise, 0, 0.18);
-  const rainLevel = scalePercent(session.ambience.rain, 0, 0.3);
-  const cafeLevel = scalePercent(session.ambience.cafe, 0, 0.22);
-  const drumLevel = scalePercent(session.mixer.drums, 0, session.mode === "remix" ? 0.62 : 0.42);
+  const fadeSeconds = smooth ? MIX_PROFILE.live.fadeSeconds : 0.015;
+  const dustLevel = scalePercent(
+    session.ambience.noise,
+    0,
+    MIX_PROFILE.live.dust,
+  );
+  const rainLevel = scalePercent(
+    session.ambience.rain,
+    0,
+    MIX_PROFILE.live.rain,
+  );
+  const cafeLevel = scalePercent(
+    session.ambience.cafe,
+    0,
+    MIX_PROFILE.live.cafe,
+  );
+  const drumLevel = scalePercent(
+    session.mixer.drums,
+    0,
+    session.mode === "remix"
+      ? MIX_PROFILE.live.drumsRemix
+      : MIX_PROFILE.live.drumsLofi,
+  );
 
-  rampAudioParam(controls.sourceGain.gain, scalePercent(session.uploadMix, 0, 1.16), context, timeConstant);
+  rampAudioParam(
+    controls.sourceGain.gain,
+    scalePercent(session.uploadMix, 0, MIX_PROFILE.live.source),
+    context,
+    fadeSeconds,
+  );
   rampAudioParam(
     controls.lowpass.frequency,
     session.mode === "lofi"
       ? scalePercent(session.fx.eq, 1800, 5600)
       : scalePercent(session.fx.eq, 5200, 12800),
     context,
-    timeConstant,
+    fadeSeconds,
   );
-  rampAudioParam(controls.feedback.gain, scalePercent(session.fx.reverb, 0.02, 0.16), context, timeConstant);
-  rampAudioParam(controls.wetGain.gain, scalePercent(session.fx.reverb, 0.015, 0.11), context, timeConstant);
-  rampAudioParam(controls.master.gain, getLiveEffectMasterLevel(session), context, timeConstant);
-  rampAudioParam(controls.layerGains.dust.gain, dustLevel, context, timeConstant);
-  rampAudioParam(controls.layerGains.rain.gain, rainLevel, context, timeConstant);
-  rampAudioParam(controls.layerGains.cafe.gain, cafeLevel, context, timeConstant);
-  rampAudioParam(controls.layerGains.drums.gain, drumLevel, context, timeConstant);
+  rampAudioParam(controls.feedback.gain, scalePercent(session.fx.reverb, 0.02, 0.16), context, fadeSeconds);
+  rampAudioParam(controls.wetGain.gain, scalePercent(session.fx.reverb, 0.015, 0.11), context, fadeSeconds);
+  rampAudioParam(controls.master.gain, getLiveEffectMasterLevel(session), context, fadeSeconds);
+  rampAudioParam(controls.layerGains.dust.gain, dustLevel, context, fadeSeconds);
+  rampAudioParam(controls.layerGains.rain.gain, rainLevel, context, fadeSeconds);
+  rampAudioParam(controls.layerGains.cafe.gain, cafeLevel, context, fadeSeconds);
+  rampAudioParam(controls.layerGains.drums.gain, drumLevel, context, fadeSeconds);
   if (runtime.playback.nativeMediaPlayback && !runtime.backgroundMix.active) {
     syncMobileEffectDiagnostics(session, "live-effects", "ready");
   }
 }
 
 function getLiveEffectMasterLevel(session) {
-  return runtime.playback.nativeMediaPlayback
-    ? scalePercent(session.mixer.master, 0, 1.08)
-    : 1.08;
+  return scalePercent(session.mixer.master, 0, MIX_PROFILE.live.master);
 }
 
 function syncMobileEffectDiagnostics(session, route, state) {
@@ -2667,6 +2741,28 @@ function syncMobileEffectDiagnostics(session, route, state) {
   root.dataset.mobileEffectDust = String(Math.round(session.ambience.noise));
   root.dataset.mobileEffectDrums = String(Math.round(session.mixer.drums));
   root.dataset.mobileEffectMaster = String(Math.round(session.mixer.master));
+  root.dataset.mobileEffectGainRain = scalePercent(
+    session.ambience.rain,
+    0,
+    MIX_PROFILE.live.rain,
+  ).toFixed(3);
+  root.dataset.mobileEffectGainCafe = scalePercent(
+    session.ambience.cafe,
+    0,
+    MIX_PROFILE.live.cafe,
+  ).toFixed(3);
+  root.dataset.mobileEffectGainDust = scalePercent(
+    session.ambience.noise,
+    0,
+    MIX_PROFILE.live.dust,
+  ).toFixed(3);
+  root.dataset.mobileEffectGainDrums = scalePercent(
+    session.mixer.drums,
+    0,
+    session.mode === "remix"
+      ? MIX_PROFILE.live.drumsRemix
+      : MIX_PROFILE.live.drumsLofi,
+  ).toFixed(3);
   root.dataset.liveEffectContext =
     runtime.livePreview.context?.state || "not-created";
   root.dataset.backgroundEffectContinuity =
@@ -2691,8 +2787,7 @@ function smoothRebuildLivePreviewGraph(session) {
   const rebuildToken = ++runtime.livePreview.rebuildToken;
 
   if (context && layerBus) {
-    layerBus.gain.cancelScheduledValues(context.currentTime);
-    layerBus.gain.setTargetAtTime(0, context.currentTime, 0.08);
+    rampAudioParam(layerBus.gain, 0, context, 0.16);
   }
 
   window.clearTimeout(runtime.livePreview.rebuildTimerId);
@@ -2701,7 +2796,7 @@ function smoothRebuildLivePreviewGraph(session) {
       return;
     }
 
-    prepareLivePreviewGraph(session)
+    ensureLivePreviewGraph(session, { smooth: true })
       .then(() => {
         if (rebuildToken !== runtime.livePreview.rebuildToken) {
           return undefined;
@@ -2737,9 +2832,22 @@ function liveSessionSignature(session) {
   ].join(":");
 }
 
-function rampAudioParam(param, value, context, timeConstant) {
-  param.cancelScheduledValues(context.currentTime);
-  param.setTargetAtTime(value, context.currentTime, timeConstant);
+function rampAudioParam(param, value, context, duration) {
+  const now = context.currentTime;
+  let held = false;
+  if (typeof param.cancelAndHoldAtTime === "function") {
+    try {
+      param.cancelAndHoldAtTime(now);
+      held = true;
+    } catch {
+      // Older mobile WebKit can expose this method before fully supporting it.
+    }
+  }
+  if (!held) {
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(param.value, now);
+  }
+  param.linearRampToValueAtTime(value, now + duration);
 }
 
 function addLiveTextureLayer(context, kind, destination) {
@@ -3065,7 +3173,7 @@ async function togglePlayer() {
 }
 
 async function playAudio(audio, options = {}) {
-  const { autoplayAttempt = false } = options;
+  const { autoplayAttempt = false, liveGraphPromise = null } = options;
   runtime.playback.desiredPlaying = true;
   runtime.playback.pendingResume = false;
   setPlaybackAudioSessionType();
@@ -3084,20 +3192,26 @@ async function playAudio(audio, options = {}) {
       runtime.wholePreviewReady &&
       (!runtime.playback.nativeMediaPlayback ||
         !runtime.backgroundMix.active);
+    const preparedLiveGraph = shouldUseLiveLayers
+      ? liveGraphPromise ||
+        ensureLivePreviewGraph(
+          runtime.livePreview.session || buildSession(),
+          { smooth: true },
+        )
+      : null;
     await audio.play();
     syncPlayerState();
     tickWaveforms();
 
     if (shouldUseLiveLayers) {
-      const session = runtime.livePreview.session || buildSession();
       try {
-        if (runtime.livePreview.controls && runtime.livePreview.signature === liveSessionSignature(session)) {
-          if (canResumeLiveAudioContext()) {
-            await runtime.livePreview.context.resume();
-          }
-          updateLivePreviewMix(session, { smooth: true });
-        } else {
-          await prepareLivePreviewGraph(session);
+        await resumeLiveAudioContext();
+        await preparedLiveGraph;
+        if (!runtime.backgroundMix.active && !audio.paused) {
+          const latestSession = buildSession();
+          runtime.livePreview.session = latestSession;
+          updateLivePreviewMix(latestSession, { smooth: true });
+          syncLivePreviewPlayback();
         }
       } catch (error) {
         console.warn("Live ambience could not start; base playback is continuing", error);
@@ -3155,14 +3269,22 @@ function syncPlayerState() {
     seekAudioElement(activeAudio, playbackDuration);
   }
 
+  const usesDesktopLiveGraph = Boolean(
+    !runtime.playback.nativeMediaPlayback &&
+      activeAudio === getWholePreviewAudioElement() &&
+      runtime.livePreview.audio === activeAudio &&
+      runtime.livePreview.controls &&
+      runtime.livePreview.mediaSource,
+  );
   const sourceMix =
     runtime.playback.nativeMediaPlayback &&
     activeAudio === getWholePreviewAudioElement() &&
     runtime.wholePreviewReady
       ? clamp(runtime.state.mixUpload, 0, 100) / 100
       : 1;
-  activeAudio.volume =
-    (clamp(runtime.state.mixMaster, 0, 100) / 100) * sourceMix;
+  activeAudio.volume = usesDesktopLiveGraph
+    ? 1
+    : (clamp(runtime.state.mixMaster, 0, 100) / 100) * sourceMix;
   const ratio = clamp(activeAudio.currentTime / playbackDuration, 0, 1);
   elements.seekSlider.value = String(Math.round(ratio * 1000));
   elements.timelineReadout.textContent = `${formatTime(Math.min(activeAudio.currentTime, playbackDuration))} / ${formatTime(playbackDuration)}`;
@@ -3727,7 +3849,7 @@ async function resumePlaybackAfterPageReturn() {
         updateLivePreviewMix(session, { smooth: false });
         syncLivePreviewPlayback();
       } else {
-        await prepareLivePreviewGraph(session);
+        await ensureLivePreviewGraph(session, { smooth: false });
       }
     }
     runtime.playback.autoplayBlocked = false;

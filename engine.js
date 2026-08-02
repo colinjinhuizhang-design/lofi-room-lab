@@ -1,5 +1,25 @@
 const AUDIO_TYPES = ["audio/mpeg", "audio/wav", "audio/x-wav", "audio/wave"];
 
+const AUDIO_MIX_PROFILE = Object.freeze({
+  background: Object.freeze({
+    ambience: 0.72,
+    drumsLofi: 0.46,
+    drumsRemix: 0.52,
+    limiterCeiling: 0.985,
+    limiterThreshold: 0.9,
+  }),
+  live: Object.freeze({
+    cafe: 0.06,
+    drumsLofi: 0.28,
+    drumsRemix: 0.34,
+    dust: 0.14,
+    fadeSeconds: 0.22,
+    master: 1,
+    rain: 0.14,
+    source: 1,
+  }),
+});
+
 const CHORD_GRAPH = [
   { degree: 0, type: "min9", next: [1, 2, 3] },
   { degree: 5, type: "maj7", next: [2, 3, 0] },
@@ -89,22 +109,18 @@ class AudioStudioEngine {
       Number(options.duration) || Number(sourceBuffer.duration) || 24,
     );
     const start = Math.max(0, Number(options.start) || 0);
-    const processingDuration =
-      session.mode === "remix"
-        ? duration * Math.max(1, tempoRatio(session)) + 0.5
-        : duration;
     const usesOriginalSource =
       start === 0 &&
-      Math.abs(processingDuration - sourceBuffer.duration) <
+      Math.abs(duration - sourceBuffer.duration) <
         1 / sourceBuffer.sampleRate;
     const loopSource = usesOriginalSource
       ? sourceBuffer
       : createLoopedAudioBuffer(
           sourceBuffer,
           start,
-          processingDuration,
+          duration,
         );
-    const rendered = await this.renderProcessedBuffer(loopSource, {
+    const rendered = await renderBackgroundVersion(loopSource, {
       ...session,
       renderProfile: "background",
       previewWindow: {
@@ -179,6 +195,106 @@ class AudioStudioEngine {
 
     return normalizeAudioBuffer(rendered, 0.92);
   }
+}
+
+async function renderBackgroundVersion(sourceBuffer, session) {
+  const duration = sourceBuffer.duration;
+  const context = new OfflineAudioContext(
+    2,
+    Math.ceil(duration * sourceBuffer.sampleRate),
+    sourceBuffer.sampleRate,
+  );
+  const mixBus = context.createGain();
+  mixBus.connect(context.destination);
+
+  const source = context.createBufferSource();
+  const sourceGain = context.createGain();
+  source.buffer = sourceBuffer;
+  sourceGain.gain.value = mixValue(session.uploadMix, 0, 1);
+  source.connect(sourceGain).connect(mixBus);
+  source.start(0);
+  source.stop(duration);
+
+  const hasAmbience = Math.max(
+    session.ambience.rain,
+    session.ambience.cafe,
+    session.ambience.noise,
+  ) > 3;
+  if (hasAmbience) {
+    const ambienceSource = context.createBufferSource();
+    const ambienceFilter = context.createBiquadFilter();
+    const ambienceGain = context.createGain();
+    ambienceSource.buffer = createAmbienceBuffer(
+      context,
+      duration,
+      session,
+      session.mode === "remix",
+    );
+    ambienceFilter.type = "lowpass";
+    ambienceFilter.frequency.value = session.mode === "remix" ? 3800 : 3000;
+    ambienceGain.gain.value = AUDIO_MIX_PROFILE.background.ambience;
+    ambienceSource
+      .connect(ambienceFilter)
+      .connect(ambienceGain)
+      .connect(mixBus);
+    ambienceSource.start(0);
+    ambienceSource.stop(duration);
+  }
+
+  if (session.mixer.drums > 3) {
+    const energetic = session.mode === "remix";
+    const drumSource = context.createBufferSource();
+    const drumFilter = context.createBiquadFilter();
+    const drumGain = context.createGain();
+    drumSource.buffer = createDrumTrackBuffer(
+      context,
+      duration,
+      session.beat.tempo,
+      session.beat.intensity,
+      session.beat.swing,
+      session.beat.style,
+      energetic,
+    );
+    drumFilter.type = energetic ? "highshelf" : "lowpass";
+    drumFilter.frequency.value = energetic ? 4200 : 5200;
+    drumFilter.gain.value = energetic ? 1.4 : 0;
+    drumGain.gain.value = mixValue(
+      session.mixer.drums,
+      0,
+      energetic
+        ? AUDIO_MIX_PROFILE.background.drumsRemix
+        : AUDIO_MIX_PROFILE.background.drumsLofi,
+    );
+    drumSource.connect(drumFilter).connect(drumGain).connect(mixBus);
+    drumSource.start(0);
+    drumSource.stop(duration);
+  }
+
+  const rendered = await context.startRendering();
+  return softLimitAudioBuffer(
+    rendered,
+    AUDIO_MIX_PROFILE.background.limiterThreshold,
+    AUDIO_MIX_PROFILE.background.limiterCeiling,
+  );
+}
+
+function softLimitAudioBuffer(buffer, threshold, ceiling) {
+  const range = Math.max(0.001, ceiling - threshold);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < data.length; index += 1) {
+      const sample = data[index];
+      const magnitude = Math.abs(sample);
+      if (magnitude <= threshold) {
+        continue;
+      }
+
+      const limited = threshold + range * Math.tanh((magnitude - threshold) / range);
+      data[index] = Math.sign(sample) * limited;
+    }
+  }
+
+  return buffer;
 }
 
 async function renderLofiVersion(sourceBuffer, session) {
@@ -1280,3 +1396,4 @@ function clamp(value, min, max) {
 }
 
 window.AudioStudioEngine = AudioStudioEngine;
+window.AudioStudioMixProfile = AUDIO_MIX_PROFILE;
